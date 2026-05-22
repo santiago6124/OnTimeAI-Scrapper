@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+data/
+artifacts/
+tmp/
+MASTER.txt
+ReleasableAircraft.zip
+
+# Validation outputs
+validation_reports/
+*.log
+
+# Secrets
+.env
+.env.local
+.env.*.local
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Notebooks
+.ipynb_checkpoints/

@@ -1,0 +1,42 @@
+# Cloud Build config — construye y publica la imagen del harvester.
+# Uso:
+#   gcloud builds submit --config=cloudbuild-harvester.yaml --project=ontimeai
+#
+# Tras el build, deploy con:
+#   gcloud run jobs deploy ontimeai-harvester \
+#     --image=us-central1-docker.pkg.dev/ontimeai/ontimeai/harvester:latest \
+#     --region=us-central1 \
+#     --service-account=$PROJECT_NUMBER-compute@developer.gserviceaccount.com \
+#     --set-env-vars=GCS_BUCKET=ontimeai-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO \
+#     --memory=1Gi --cpu=1 --max-retries=1 --task-timeout=300s
+#
+# Scheduler:
+#   gcloud scheduler jobs create http ontimeai-harvester-scheduler \
+#     --location=us-central1 \
+#     --schedule="5,20,35,50 * * * *" \
+#     --uri="https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/ontimeai/jobs/ontimeai-harvester:run" \
+#     --http-method=POST \
+#     --oauth-service-account-email=$PROJECT_NUMBER-compute@developer.gserviceaccount.com
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=Dockerfile.harvester
+      - --tag=gcr.io/$PROJECT_ID/ontimeai-harvester:latest
+      - --tag=gcr.io/$PROJECT_ID/ontimeai-harvester:$BUILD_ID
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - gcr.io/$PROJECT_ID/ontimeai-harvester
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+images:
+  - gcr.io/$PROJECT_ID/ontimeai-harvester:latest
+  - gcr.io/$PROJECT_ID/ontimeai-harvester:$BUILD_ID

@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps mínimos
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r /app/requirements.txt
+
+COPY ontimeai_scrapper /app/ontimeai_scrapper
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    AIRPORT_CODE=KATL \
+    LOG_LEVEL=INFO
+
+# Cloud Run Jobs invoca el entrypoint sin args adicionales por defecto
+ENTRYPOINT ["python", "-m", "ontimeai_scrapper.harvester"]
