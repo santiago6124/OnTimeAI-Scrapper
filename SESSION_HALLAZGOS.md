@@ -14,7 +14,7 @@ confirman supuestos del `PLAN_HARVESTER_LINEAGE.md` original.
 | **Fase 1** — Harvester ATL anchor (Capa 1) | ✅ DEPLOYED + en producción 24/7 |
 | **Fase 2** — Chain walk lazy (Capa 2) | ✅ DEPLOYED + cumple criterio plan |
 | **Fase 3** — Refresh + FAA + OpenSky fallback | 🟡 [TODO] No bloqueante |
-| **Fase 4** — Switch live_pull.py + A/B test | 🔴 Código deployed, BLOCKED por bug LightGBM SIGSEGV pre-existente |
+| **Fase 4** — Switch live_pull.py + A/B test | ✅ Bugs del backend resueltos 2026-05-24 (ver `OnTimeAI-Backend/HALLAZGOS_LIVE_PREDICT_FIX.md`). Switch a `LIVE_DATA_SOURCE=harvester` pendiente tras resolver race condition |
 
 **Métricas finales** (a 2026-05-24 16:06 UTC, tras ~42h de producción):
 - 16,207 vuelos FR24 ingeridos (vs 0 antes de Fase 1)
@@ -207,6 +207,26 @@ Postergada porque el harvester actual cumple el criterio del plan sin estos comp
 
 **Scheduler ontimeai-pull-scheduler en PAUSED** desde 2026-05-21 (probablemente lo deshabilitó GCS auto tras N failures consecutivos, o fue manual).
 
+> **📌 CORRECCIÓN POSTERIOR (2026-05-24)** — Las 4 hipótesis arriba eran TODAS
+> incorrectas. La sesión del 2026-05-24 desarmó el crash y encontró que:
+>
+> 1. El crash NO ocurría en `predict_proba` sino en `lgb.Booster(model_file=...)`
+>    (el LOAD del modelo, no el predict).
+> 2. La causa raíz era `artifacts/4year_v9/model.lgb` con **line endings CRLF**
+>    (Windows-style). LightGBM 4.x parsea esperando LF; con CRLF el parser
+>    queda mal-alineado, emite cascade de "Model format error" y SIGSEGV.
+> 3. Adicionalmente había un bug pandas 3.x en `live.py:632` que crasheaba
+>    ANTES del load del modelo (filas con `origin=NULL` del harvester FR24
+>    rompiendo `np.where(Series.eq(...))`).
+> 4. Y un tercer bug: `conn.close()` faltante hacía que las predicciones no
+>    persistieran al GCS upload.
+>
+> Detalle completo del debug y los fixes en
+> `OnTimeAI-Backend/HALLAZGOS_LIVE_PREDICT_FIX.md`.
+>
+> Tras los 3 fixes, el run 856 (2026-05-24T19:11Z) generó 52 predicciones
+> reales sin errores.
+
 ---
 
 ## 4. Bugs descubiertos en código del backend (no causados por nuestros cambios)
@@ -302,35 +322,40 @@ para que el live-pull empiece a predecir directamente del buffer cosechado por e
 
 ## 8. Pendientes (ordenados por prioridad)
 
-### 8.1 🔴 BLOQUEANTE — Debug del LightGBM SIGSEGV
-**Owner**: requiere debug local del backend
-**Impacto**: sin esto, NO hay predicciones — el modelo está caído desde 2026-05-21 20:05 UTC.
-**Sugerencia de diagnóstico**:
-1. Repro local con `live_data.db` actual (ya en `tmp/live_data.now.db`)
-2. Bypass `lineage_fallback.joblib`: setear `fallback=None` siempre en `live_pull.py:201-211` y testear
-3. Si crashea igual → revisar feature dtypes en `prepare_inference_frame()` (¿NaN en col esperada como float?)
-4. Si no crashea → bug en cómo `load_lookups()` deserializa el .joblib
+### 8.1 ✅ RESUELTO (2026-05-24) — Debug del LightGBM SIGSEGV
+**Status**: 4 bugs encontrados y fixeados durante sesión 2026-05-24. Ver
+`OnTimeAI-Backend/HALLAZGOS_LIVE_PREDICT_FIX.md`. El SIGSEGV venía de CRLF en
+`model.lgb`, no de los componentes que se sospechaban. Run 856 con 52
+predicciones reales generado exitosamente.
 
-### 8.2 🟡 Reactivar `ontimeai-pull-scheduler`
-Después de fixear el bug LightGBM:
+### 8.2 🔴 NUEVO BLOQUEANTE — Race condition Backend vs Harvester
+Patrón actual `download → modify → upload` del archivo entero no es seguro
+con dos writers concurrentes. Cada vez que ambos jobs corren cerca, uno pisa
+al otro. Mientras no se resuelva, ambos schedulers tienen que quedar PAUSED.
+Opciones evaluadas: stagger schedules, bucket separado para predicciones,
+Cloud SQL, lock via GCS object. Ver `HALLAZGOS_LIVE_PREDICT_FIX.md §3.6`.
+
+### 8.3 🟡 Reactivar schedulers (después de resolver §8.2)
 ```bash
 gcloud scheduler jobs resume ontimeai-pull-scheduler --location=us-central1 --project=ontimeai
+gcloud scheduler jobs resume ontimeai-harvester-scheduler --location=us-central1 --project=ontimeai
 ```
 
-### 8.3 🟡 Switch a `LIVE_DATA_SOURCE=harvester` (Fase 4 completa)
-Tras 24-48h de live-pull corriendo en `aeroapi` para confirmar bug LightGBM resuelto, switchear a `harvester`. Esto deprecia AeroAPI definitivamente.
+### 8.4 🟡 Switch a `LIVE_DATA_SOURCE=harvester` (Fase 4 completa)
+Tras 24-48h de live-pull corriendo en `aeroapi` post §8.2/§8.3, switchear a
+`harvester`. Esto deprecia AeroAPI definitivamente.
 
-### 8.4 🟢 Commit + push de los repos
+### 8.5 🟢 Commit + push de los repos
 - `OnTimeAI-Scrapper`: sin commits (working tree con Fase 1+2+docs)
-- `OnTimeAI-Backend`: cambios uncommitted en `live_pull.py` (Fase 4 código)
+- `OnTimeAI-Backend`: uncommitted Fase 4 + fixes 2026-05-24 (NA, CRLF, conn.close, live.py:632, model.py, requirements-api.txt, live_pull.py, model.lgb x2)
 
-### 8.5 🟢 [TODO] Fase 3 — Refresh + FAA + OpenSky fallback
+### 8.6 🟢 [TODO] Fase 3 — Refresh + FAA + OpenSky fallback
 No urgente. Trigger: si vemos incidente sostenido de FR24.
 
-### 8.6 🟢 Cosmético — fix `netCDF4` missing warning
+### 8.7 🟢 Cosmético — fix `netCDF4` missing warning
 Agregar `netCDF4` a `requirements-api.txt` del backend, O eliminar el path v7 wind features si no se usa.
 
-### 8.7 🟢 Cosmético — diferenciar `cache_hits` vs `cache_deferred` en logs Capa 2
+### 8.8 🟢 Cosmético — diferenciar `cache_hits` vs `cache_deferred` en logs Capa 2
 El log dice `cache_hits=N` pero realmente cuenta "tails deferred por budget cap" mezclados con cache hits genuinos. Solo cosmético, no funcional.
 
 ---
