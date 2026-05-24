@@ -19,13 +19,25 @@ Detalle completo: ver `OnTimeAI-Backend/PLAN_HARVESTER_LINEAGE.md`.
 
 ---
 
-## Estado actual
+## Estado actual (2026-05-24)
 
-- [x] **Fase 0 — Validación local** (`scripts/validate_sources.py`)
-- [ ] **Fase 1 — Harvester ATL anchor** (Capa 1)
-- [ ] **Fase 2 — Chain walk** (Capa 2)
-- [ ] **Fase 3 — Refresh activo + FAA + fallback OpenSky** (Capa 3)
-- [ ] **Fase 4 — Switch del live_pull.py** (A/B testing)
+- [x] **Fase 0 — Validación local** (`scripts/validate_sources.py`) — `FASE_0_HALLAZGOS.md`
+- [x] **Fase 1 — Harvester ATL anchor (Capa 1)** — DEPLOYED 2026-05-22, en producción 24/7
+- [x] **Fase 2 — Chain walk lazy (Capa 2)** — DEPLOYED 2026-05-22, FR24 inbound coverage 92.3%
+- [ ] **Fase 3 — Refresh activo + FAA + fallback OpenSky** — `[TODO]` no urgente
+- [~] **Fase 4 — Switch del live_pull.py** — código deployed, BLOCKED por bug LightGBM SIGSEGV preexistente en backend
+
+Documentación completa de hallazgos: `SESSION_HALLAZGOS.md`
+
+### Producción a la fecha
+
+| Métrica | Valor |
+|---|---|
+| Vuelos FR24 ingeridos | 16,207 |
+| Tails en `tail_lineage_cache` | 879 |
+| FR24 inbound coverage | 92.3% (criterio ≥0.90 ✅) |
+| Failures del harvester en 42h | 0 |
+| Costo observado/día | ~$0.06 USD |
 
 ---
 
