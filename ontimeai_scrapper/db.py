@@ -105,14 +105,67 @@ CREATE TABLE IF NOT EXISTS harvester_runs (
     status TEXT,
     error TEXT
 );
+
+-- Mejora #1: ADS-B real-time positions from OpenSky bbox query.
+-- Captured each tick (~15 min cadence) for aircraft in a bbox around KATL.
+-- Backend can compute time-to-ATL ETAs by joining via callsign or icao24
+-- (callsign maps to op_carrier+flight_number when ICAO format like DAL123).
+CREATE TABLE IF NOT EXISTS aircraft_position (
+    icao24 TEXT NOT NULL,
+    captured_at_utc TEXT NOT NULL,
+    callsign TEXT,
+    registration TEXT,             -- N-number (tail_num) when source provides it
+    aircraft_type TEXT,            -- ICAO typecode when available
+    lat REAL,
+    lon REAL,
+    baro_altitude_m REAL,
+    geo_altitude_m REAL,
+    velocity_mps REAL,
+    true_track_deg REAL,
+    vertical_rate_mps REAL,
+    on_ground INTEGER,
+    origin_country TEXT,
+    source TEXT,                   -- 'airplanes.live' | 'opensky'
+    PRIMARY KEY (icao24, captured_at_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_aircraft_position_callsign
+    ON aircraft_position(callsign, captured_at_utc);
+CREATE INDEX IF NOT EXISTS idx_aircraft_position_captured
+    ON aircraft_position(captured_at_utc);
+-- idx_aircraft_position_registration created lazily in _migrate_aircraft_position
+-- because the column was added after the initial table layout.
 """
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Crea tablas si no existen. Idempotente. Llamar al abrir cada conexión."""
+    """Crea tablas si no existen + migra columnas nuevas. Idempotente."""
     conn.executescript(BACKEND_SCHEMA)
     conn.executescript(HARVESTER_SCHEMA)
+    _migrate_aircraft_position(conn)
     conn.commit()
+
+
+def _migrate_aircraft_position(conn: sqlite3.Connection) -> None:
+    """ALTER TABLE para columnas agregadas post-creación inicial.
+
+    CREATE TABLE IF NOT EXISTS no altera tablas existentes. Si el harvester
+    corrió antes de Mejora #1 con menos columnas, agregamos las que faltan.
+    """
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(aircraft_position)").fetchall()}
+    except sqlite3.OperationalError:
+        return  # table doesn't exist yet; CREATE will handle it
+    if not cols:
+        return
+    if "registration" not in cols:
+        conn.execute("ALTER TABLE aircraft_position ADD COLUMN registration TEXT")
+    if "aircraft_type" not in cols:
+        conn.execute("ALTER TABLE aircraft_position ADD COLUMN aircraft_type TEXT")
+    if "source" not in cols:
+        conn.execute("ALTER TABLE aircraft_position ADD COLUMN source TEXT")
+    # Index creation is idempotent and safe now that column exists.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_aircraft_position_registration "
+                 "ON aircraft_position(registration, captured_at_utc)")
 
 
 @contextmanager
@@ -264,6 +317,34 @@ def upsert_actuals(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
             "settled_at_utc": now,
         }
         conn.execute(sql, params)
+        count += 1
+    return count
+
+
+def upsert_aircraft_positions(
+    conn: sqlite3.Connection, positions: Iterable[dict[str, Any]]
+) -> int:
+    """UPSERT en aircraft_position. Cada `position` viene normalizada de
+    airplanes.live o OpenSky (Mejora #1). Returns count written."""
+    sql = """
+    INSERT OR REPLACE INTO aircraft_position (
+        icao24, captured_at_utc, callsign, registration, aircraft_type,
+        lat, lon, baro_altitude_m, geo_altitude_m, velocity_mps,
+        true_track_deg, vertical_rate_mps, on_ground, origin_country, source
+    ) VALUES (
+        :icao24, :captured_at_utc, :callsign, :registration, :aircraft_type,
+        :lat, :lon, :baro_altitude_m, :geo_altitude_m, :velocity_mps,
+        :true_track_deg, :vertical_rate_mps, :on_ground, :origin_country, :source
+    )
+    """
+    count = 0
+    for p in positions:
+        if not p.get("icao24") or not p.get("captured_at_utc"):
+            continue
+        # Ensure all expected keys exist (fill missing with None)
+        for k in ("registration", "aircraft_type", "origin_country", "source"):
+            p.setdefault(k, None)
+        conn.execute(sql, p)
         count += 1
     return count
 

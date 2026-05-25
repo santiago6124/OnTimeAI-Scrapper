@@ -41,6 +41,36 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def _adaptive_freshness_hours(
+    conn: sqlite3.Connection, tail: str, default_hours: int
+) -> int:
+    """TTL adaptativo según frecuencia de operación del tail (Mejora #5).
+
+    Tails con muchos legs/día → refresh más frecuente.
+    Tails ocasionales → TTL largo (menos AeroAPI burn).
+
+    Fórmula: clip(24 / legs_today, 2h, 24h). Si la query falla, fallback al
+    default configurado.
+    """
+    try:
+        today = _now().strftime("%Y-%m-%d")
+        row = conn.execute(
+            """SELECT COUNT(*) AS n FROM flights
+               WHERE tail_num = ?
+                 AND fl_date = ?""",
+            (tail, today),
+        ).fetchone()
+        legs_today = int(row["n"] if row else 0)
+    except Exception:
+        return default_hours
+
+    if legs_today >= 5:
+        return 2   # high-frequency tail
+    if legs_today >= 2:
+        return default_hours  # 6h default
+    return 24  # low-frequency / one-leg / never-seen-today
+
+
 def maybe_hydrate_tail(
     conn: sqlite3.Connection,
     fr24_client: FR24Client,
@@ -58,6 +88,9 @@ def maybe_hydrate_tail(
     if not tail:
         return HydrationStatus.EMPTY, 0, 0
 
+    # Adaptive TTL based on tail activity today (overrides freshness_hours arg).
+    effective_freshness = _adaptive_freshness_hours(conn, tail, freshness_hours)
+
     row = conn.execute(
         "SELECT hydrated_until, consecutive_failures FROM tail_lineage_cache WHERE tail = ?",
         (tail,),
@@ -72,7 +105,7 @@ def maybe_hydrate_tail(
         except (TypeError, ValueError):
             hydrated_until = now - timedelta(days=365)
 
-        if hydrated_until > now - timedelta(hours=freshness_hours):
+        if hydrated_until > now - timedelta(hours=effective_freshness):
             return HydrationStatus.HIT_CACHE, 0, 0
         if (row["consecutive_failures"] or 0) >= max_failures:
             return HydrationStatus.SKIPPED_FAILURES, 0, 0
@@ -198,7 +231,8 @@ def select_tails_to_hydrate(
 ) -> list[str]:
     """Selecciona hasta `budget` tails que necesitan hidratación.
 
-    Prioriza: never-hydrated > cache-expired > recientes con cache.
+    Mejora #5: TTL adaptativo por tail. Cada tail tiene su propio threshold
+    según frecuencia de operación. Prioridad: high-freq > never > expired.
     """
     if not candidate_tails:
         return []
@@ -215,13 +249,17 @@ def select_tails_to_hydrate(
 
     cached = {r["tail"]: r for r in rows}
     now = _now()
-    threshold = now - timedelta(hours=freshness_hours)
 
+    high_freq: list[str] = []
     never: list[str] = []
     expired: list[str] = []
     for t in sorted(candidate_tails):
+        # Per-tail adaptive TTL
+        ttl_hours = _adaptive_freshness_hours(conn, t, freshness_hours)
+        threshold = now - timedelta(hours=ttl_hours)
+
         if t not in cached:
-            never.append(t)
+            (high_freq if ttl_hours <= 2 else never).append(t)
             continue
         try:
             hu = datetime.fromisoformat(cached[t]["hydrated_until"])
@@ -231,7 +269,7 @@ def select_tails_to_hydrate(
             expired.append(t)
             continue
         if hu < threshold and (cached[t]["consecutive_failures"] or 0) < config.LINEAGE_MAX_CONSECUTIVE_FAILURES:
-            expired.append(t)
+            (high_freq if ttl_hours <= 2 else expired).append(t)
 
-    # Priorizar never > expired
-    return (never + expired)[:budget]
+    # Priorizar high-frequency > never-hydrated > expired
+    return (high_freq + never + expired)[:budget]

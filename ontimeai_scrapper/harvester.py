@@ -36,6 +36,8 @@ from .lineage_cache import (
     maybe_hydrate_tail,
     select_tails_to_hydrate,
 )
+from .airplanes_live_client import AirplanesLiveClient
+from .opensky_client import OpenSkyClient
 
 logging.basicConfig(
     level=config.LOG_LEVEL,
@@ -245,6 +247,10 @@ def main() -> int:
     # (cookies + TLS impersonation) que pasa Cloudflare en un solo warm-up.
     client = FR24Client()
 
+    # Mejora #1: capturar OpenSky ADS-B positions opt-in (default ON, gratis)
+    opensky_enabled = os.getenv("OPENSKY_ENABLED", "1").lower() in ("1", "true", "yes")
+    n_adsb = 0
+
     stats: HarvestStats
     chain_stats: HarvestStats | None = None
     with db.open_db(local_path) as conn:
@@ -270,6 +276,35 @@ def main() -> int:
                 error=stats.error,
             )
 
+        # Mejora #1 — ADS-B snapshot. Try airplanes.live first (returns
+        # registration N-number which links directly to flights.tail_num).
+        # Fall back to OpenSky if airplanes.live fails. Both gratis.
+        # Non-blocking: failure is silent (returns 0 positions). 1 call/tick.
+        if opensky_enabled and not args.dry_run:
+            positions = []
+            adsb_source = None
+            try:
+                ap_live = AirplanesLiveClient()
+                positions = ap_live.get_aircraft_point()
+                adsb_source = "airplanes.live"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("airplanes_live: enrichment failed (non-fatal): %s", exc)
+
+            if not positions:
+                try:
+                    opensky = OpenSkyClient()
+                    positions = opensky.get_states_bbox()
+                    adsb_source = "opensky"
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("opensky: fallback also failed (non-fatal): %s", exc)
+
+            if positions:
+                n_adsb = db.upsert_aircraft_positions(conn, positions)
+                log.info("adsb_capture: source=%s captured=%d aircraft in ATL area",
+                         adsb_source, n_adsb)
+            else:
+                log.info("adsb_capture: both sources returned empty (likely network or rate)")
+
         # Capa 2 — chain walk lazy
         if config.LINEAGE_ENABLED and not args.skip_chain_walk and stats.unique_tails:
             chain_stats = harvest_chain_walk(
@@ -293,13 +328,14 @@ def main() -> int:
                 )
 
     log.info(
-        "DONE capa1=%s pages=%s calls=%d flights=%d actuals=%d tails_seen=%d duration=%.1fs status=%s",
+        "DONE capa1=%s pages=%s calls=%d flights=%d actuals=%d tails_seen=%d adsb=%d duration=%.1fs status=%s",
         stats.layer,
         stats.pages_visited,
         stats.n_calls,
         stats.n_flights_upserted,
         stats.n_actuals_upserted,
         stats.n_tails_hydrated,
+        n_adsb,
         stats.duration_seconds,
         stats.status,
     )
