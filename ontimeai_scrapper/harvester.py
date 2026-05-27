@@ -34,6 +34,7 @@ from .fr24_client import (
 from .lineage_cache import (
     HydrationStatus,
     maybe_hydrate_tail,
+    purge_stale_cache,
     select_tails_to_hydrate,
 )
 from .airplanes_live_client import AirplanesLiveClient
@@ -123,6 +124,58 @@ def harvest_atl_anchor(
 
     stats.duration_seconds = time.monotonic() - started
     return stats
+
+
+def expand_candidate_tails(conn, base_tails: set[str], *, stale_hours: int = 24,
+                           adsb_minutes: int = 60) -> set[str]:
+    """Adds bootstrap-requested + stale-cache + ADS-B-visible tails to the
+    chain-walk candidate set.
+
+    The original implementation only chain-walked tails seen in this tick's
+    atl_anchor (FR24 KATL arrivals/departures). That misses three populations
+    we *can* learn about for free:
+
+      1. Tails the backend bootstrapped (placeholder rows with
+         `last_pull_source = 'bootstrap-request'`).
+      2. Tails currently in the cache but with `hydrated_until` older than
+         `stale_hours`.
+      3. Tails seen in `aircraft_position` (airplanes.live / OpenSky) flying
+         in the ATL area within the last `adsb_minutes`.
+
+    All three are likely to fly an ATL-bound leg soon. Hydrating them
+    proactively expands chain-walk coverage from "tails seen at ATL today"
+    to "tails relevant to ATL operations".
+    """
+    out = set(base_tails)
+
+    # Bootstrap-requested + stale-cache tails
+    rows = conn.execute(
+        f"""
+        SELECT tail FROM tail_lineage_cache
+        WHERE last_pull_source = 'bootstrap-request'
+           OR hydrated_until < datetime('now', '-{int(stale_hours)} hours')
+        """
+    ).fetchall()
+    for r in rows:
+        if r[0]:
+            out.add(r[0].strip().upper())
+
+    # ADS-B visible tails (registration is the N-number)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT registration FROM aircraft_position
+            WHERE registration IS NOT NULL AND registration <> ''
+              AND captured_at_utc > datetime('now', '-{int(adsb_minutes)} minutes')
+            """
+        ).fetchall()
+        for r in rows:
+            if r[0]:
+                out.add(r[0].strip().upper())
+    except Exception as exc:  # noqa: BLE001 — table may not exist yet
+        log.debug("expand_candidate_tails: aircraft_position skipped (%s)", exc)
+
+    return out
 
 
 def harvest_chain_walk(
@@ -306,11 +359,31 @@ def main() -> int:
                 log.info("adsb_capture: both sources returned empty (likely network or rate)")
 
         # Capa 2 — chain walk lazy
-        if config.LINEAGE_ENABLED and not args.skip_chain_walk and stats.unique_tails:
+        if config.LINEAGE_ENABLED and not args.skip_chain_walk:
+            # Housekeeping: drop cache rows untouched for >30 days. Keeps the
+            # table from growing unbounded with retired/repainted tails while
+            # preserving bootstrap-pending placeholders the backend may still
+            # be waiting on.
+            if not args.dry_run:
+                purge_days = int(os.getenv("LINEAGE_CACHE_PURGE_DAYS", "30"))
+                n_purged = purge_stale_cache(conn, days=purge_days)
+                if n_purged:
+                    log.info("cache_purge: removed %d stale rows (>%dd)", n_purged, purge_days)
+
+            # Expand beyond just the tails seen in atl_anchor: include
+            # bootstrap-requested tails (from backend bootstrap), stale-cache
+            # tails (>24h), and ADS-B-visible tails. These are all likely to
+            # fly an ATL leg soon and are worth hydrating proactively.
+            expanded = expand_candidate_tails(conn, stats.unique_tails)
+            log.info(
+                "chain_walk candidates: atl_anchor=%d expanded=%d (delta=%d)",
+                len(stats.unique_tails), len(expanded),
+                len(expanded) - len(stats.unique_tails),
+            )
             chain_stats = harvest_chain_walk(
                 conn,
                 client,
-                stats.unique_tails,
+                expanded,
                 budget=args.lineage_budget,
                 dry_run=args.dry_run,
             )

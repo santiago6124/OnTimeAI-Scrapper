@@ -231,8 +231,16 @@ def select_tails_to_hydrate(
 ) -> list[str]:
     """Selecciona hasta `budget` tails que necesitan hidratación.
 
-    Mejora #5: TTL adaptativo por tail. Cada tail tiene su propio threshold
-    según frecuencia de operación. Prioridad: high-freq > never > expired.
+    Priority order (highest -> lowest):
+      1. bootstrap_pending - backend explicitly requested via placeholder rows
+      2. predicted_today   - in flights with a prediction scheduled today
+      3. high_freq         - >= 5 legs today (adaptive TTL 2h)
+      4. never             - never-hydrated tails (cache miss)
+      5. expired           - stale cache (TTL elapsed)
+
+    The first two classes are "lineage-critical": they directly affect today's
+    predictions. They jump ahead of the general high_freq queue so the limited
+    per-tick budget always lands on tails the model is about to score.
     """
     if not candidate_tails:
         return []
@@ -240,36 +248,105 @@ def select_tails_to_hydrate(
     placeholders = ",".join("?" * len(candidate_tails))
     rows = conn.execute(
         f"""
-        SELECT tail, hydrated_until, consecutive_failures
+        SELECT tail, hydrated_until, consecutive_failures, last_pull_source
         FROM tail_lineage_cache
         WHERE tail IN ({placeholders})
         """,
         tuple(sorted(candidate_tails)),
     ).fetchall()
-
     cached = {r["tail"]: r for r in rows}
-    now = _now()
 
+    # Pull the set of tails that have predictions scheduled today.
+    # These are the tails the backend *just* predicted on - the lineage data
+    # for them is what powers today's AUC. Highest priority.
+    predicted_today: set[str] = set()
+    try:
+        today_rows = conn.execute(
+            """
+            SELECT DISTINCT f.tail_num FROM predictions p
+            JOIN flights f ON f.fa_flight_id = p.fa_flight_id
+            WHERE substr(p.predicted_at_utc, 1, 10) = strftime('%Y-%m-%d', 'now')
+              AND f.tail_num IS NOT NULL AND f.tail_num <> ''
+            """
+        ).fetchall()
+        predicted_today = {r[0].strip().upper() for r in today_rows if r[0]}
+    except Exception:  # noqa: BLE001 - tolerate missing table in early bootstrap
+        pass
+
+    now = _now()
+    bootstrap_pending: list[str] = []
+    predicted_today_list: list[str] = []
     high_freq: list[str] = []
     never: list[str] = []
     expired: list[str] = []
+
     for t in sorted(candidate_tails):
-        # Per-tail adaptive TTL
         ttl_hours = _adaptive_freshness_hours(conn, t, freshness_hours)
         threshold = now - timedelta(hours=ttl_hours)
+        crow = cached.get(t)
 
-        if t not in cached:
+        # Bootstrap-pending = highest priority. The backend explicitly asked
+        # for this tail; we should not let ADS-B noise outrank it.
+        if crow is not None and (crow["last_pull_source"] or "") == "bootstrap-request":
+            bootstrap_pending.append(t)
+            continue
+
+        # Predicted-today = second highest. We're going to score this tail
+        # in the next backend tick and we want lineage data to drive that.
+        if t in predicted_today:
+            if crow is None:
+                predicted_today_list.append(t)
+                continue
+            try:
+                hu = datetime.fromisoformat(crow["hydrated_until"])
+                if hu.tzinfo is None:
+                    hu = hu.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                predicted_today_list.append(t)
+                continue
+            if (hu < threshold
+                    and (crow["consecutive_failures"] or 0)
+                    < config.LINEAGE_MAX_CONSECUTIVE_FAILURES):
+                predicted_today_list.append(t)
+            continue
+
+        # Default classification for general candidate tails.
+        if crow is None:
             (high_freq if ttl_hours <= 2 else never).append(t)
             continue
         try:
-            hu = datetime.fromisoformat(cached[t]["hydrated_until"])
+            hu = datetime.fromisoformat(crow["hydrated_until"])
             if hu.tzinfo is None:
                 hu = hu.replace(tzinfo=timezone.utc)
         except (TypeError, ValueError):
             expired.append(t)
             continue
-        if hu < threshold and (cached[t]["consecutive_failures"] or 0) < config.LINEAGE_MAX_CONSECUTIVE_FAILURES:
+        if (hu < threshold
+                and (crow["consecutive_failures"] or 0)
+                < config.LINEAGE_MAX_CONSECUTIVE_FAILURES):
             (high_freq if ttl_hours <= 2 else expired).append(t)
 
-    # Priorizar high-frequency > never-hydrated > expired
-    return (high_freq + never + expired)[:budget]
+    ordered = bootstrap_pending + predicted_today_list + high_freq + never + expired
+    return ordered[:budget]
+
+
+def purge_stale_cache(
+    conn: sqlite3.Connection,
+    *,
+    days: int = 30,
+) -> int:
+    """Delete tail_lineage_cache rows whose hydrated_until is older than `days`.
+
+    Bootstrap-pending placeholder rows (hydrated_until = '1970-01-01...') are
+    excluded — those are explicit requests from the backend waiting to be
+    fulfilled and must not be dropped. Returns number of rows deleted.
+    """
+    cutoff_iso = _iso(_now() - timedelta(days=days))
+    cur = conn.execute(
+        """DELETE FROM tail_lineage_cache
+           WHERE hydrated_until < ?
+             AND COALESCE(last_pull_source, '') <> 'bootstrap-request'""",
+        (cutoff_iso,),
+    )
+    conn.commit()
+    return cur.rowcount or 0

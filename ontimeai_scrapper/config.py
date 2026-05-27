@@ -12,7 +12,7 @@ FR24_MAX_RETRIES: int = int(os.getenv("FR24_MAX_RETRIES", "3"))
 FR24_TIMEOUT_SECONDS: float = float(os.getenv("FR24_TIMEOUT_SECONDS", "20.0"))
 
 FR24_HISTORY_BASE_URL: str = "https://api.flightradar24.com/common/v1/flight/list.json"
-FR24_HISTORY_DEFAULT_LIMIT: int = 25
+FR24_HISTORY_DEFAULT_LIMIT: int = int(os.getenv("FR24_HISTORY_LIMIT", "50"))
 FR24_HISTORY_DAYS_LOOKBACK: int = 7
 
 OPENSKY_BASE_URL: str = "https://opensky-network.org/api"
