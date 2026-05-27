@@ -266,8 +266,11 @@ def _normalize_page(page: FR24Page, *, anchor_airport: str) -> tuple[list[dict],
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--airport", default=config.AIRPORT_CODE)
-    p.add_argument("--max-pages", type=int, default=7,
-                   help="Max páginas a iterar; ~4-7 cubren ventana ±6h en ATL")
+    p.add_argument("--max-pages", type=int,
+                   default=int(os.getenv("FR24_MAX_PAGES", "10")),
+                   help="Max páginas a iterar; ATL devuelve has_more=True en p7 "
+                        "(>1400 vuelos en la ventana ±6h), default 10 captura "
+                        "el remanente. Cada página extra ~1.5s. Env: FR24_MAX_PAGES")
     p.add_argument("--flight-limit", type=int, default=100)
     p.add_argument("--local-db", default=None,
                    help="Path local — saltea download/upload GCS")
