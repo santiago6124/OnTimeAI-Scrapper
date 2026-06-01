@@ -208,11 +208,35 @@ def _status_flags(flight: dict[str, Any]) -> tuple[int | None, int | None]:
     return cancelled, diverted
 
 
+SYNTHETIC_ID_PREFIX = "SYN-"
+
+
+def _synthetic_id(
+    op_carrier: str | None,
+    flight_number: str | None,
+    origin: str | None,
+    dest: str | None,
+    fl_date: str | None,
+) -> str | None:
+    """Deterministic placeholder id for a future leg FR24 hasn't assigned an id to.
+
+    Keyed on flight identity `(op_carrier, flight_number, origin, dest, fl_date)` so it
+    is stable across the null->real id transition: when the same physical flight later
+    appears on the airport board with a real FR24 id, reconciliation matches the two on
+    this same identity and collapses the placeholder. Returns None if any component is
+    missing (can't form a stable key).
+    """
+    if not (op_carrier and flight_number and origin and dest and fl_date):
+        return None
+    return f"{SYNTHETIC_ID_PREFIX}{op_carrier}{flight_number}-{origin}-{dest}-{fl_date}"
+
+
 def normalize_flight(
     flight: dict[str, Any],
     *,
     anchor_airport: str | None = None,
     is_arrival_side: bool | None = None,
+    allow_synthetic_id: bool = False,
 ) -> dict[str, Any] | None:
     """Convierte el dict anidado de FR24 al schema flat de la tabla flights.
 
@@ -221,13 +245,15 @@ def normalize_flight(
         anchor_airport: código del aeropuerto-anchor (ej. KATL/ATL) cuando viene de Capa 1.
             Se usa para inferir el código que FR24 omite (dest en arrivals, origin en departures).
         is_arrival_side: si está scoped a anchor: True=anchor es destino, False=anchor es origen.
+        allow_synthetic_id: si True y FR24 no asignó id (vuelo futuro), sintetiza un id
+            determinístico desde (op_carrier, flight_number, origin, dest, fl_date). Lo usa la
+            captura de future-legs del chain walk; la reconciliación luego colapsa el placeholder
+            contra el row con id real. Default False = comportamiento original.
 
-    Devuelve None si el flight no tiene fa_flight_id usable.
+    Devuelve None si el flight no tiene fa_flight_id usable (ni real ni sintetizable).
     """
     ident = flight.get("identification") or {}
     fa_flight_id = ident.get("id")
-    if not fa_flight_id:
-        return None
 
     aircraft = flight.get("aircraft") or {}
     airline = flight.get("airline") or {}
@@ -237,6 +263,7 @@ def normalize_flight(
     time_block = flight.get("time") or {}
     sched = time_block.get("scheduled") or {}
     real = time_block.get("real") or {}
+    estimated = time_block.get("estimated") or {}
 
     origin_iata = (((origin.get("code") or {}).get("iata")) or "").upper() or None
     dest_iata = (((dest.get("code") or {}).get("iata")) or "").upper() or None
@@ -258,6 +285,13 @@ def normalize_flight(
     scheduled_out_utc = _epoch_to_iso(sched_out_epoch)
     scheduled_in_utc = _epoch_to_iso(sched_in_epoch)
 
+    # FR24 exposes a separate `estimated` block (predicted gate/touchdown times)
+    # that updates as a delay develops. The backend's prediction-target query
+    # treats a flight as "still upcoming" via COALESCE(estimated_out_utc,
+    # scheduled_out_utc), so surfacing this keeps that predicate delay-aware.
+    estimated_out_utc = _epoch_to_iso(estimated.get("departure"))
+    estimated_in_utc = _epoch_to_iso(estimated.get("arrival"))
+
     crs_elapsed_min: float | None = None
     if sched_out_epoch and sched_in_epoch:
         try:
@@ -267,14 +301,25 @@ def normalize_flight(
 
     ident_iata = (ident.get("number") or {}).get("default")
     op_carrier = ((airline.get("code") or {}).get("iata"))
+    flight_number = _parse_flight_number(ident_iata)
     cancelled, diverted = _status_flags(flight)
+
+    # FR24 leaves identification.id == null for flights it hasn't activated yet
+    # (typically until ~1h before departure), so the default path drops them. When
+    # the caller opts in (future-leg capture), synthesize a deterministic placeholder
+    # id from the flight identity instead of discarding the leg.
+    if not fa_flight_id:
+        if allow_synthetic_id:
+            fa_flight_id = _synthetic_id(op_carrier, flight_number, origin_iata, dest_iata, fl_date)
+        if not fa_flight_id:
+            return None
 
     return {
         "fa_flight_id": fa_flight_id,
         "stable_id": fa_flight_id,
         "ident_iata": ident_iata,
         "op_carrier": op_carrier,
-        "flight_number": _parse_flight_number(ident_iata),
+        "flight_number": flight_number,
         "tail_num": (aircraft.get("registration") or None),
         "origin": origin_iata,
         "dest": dest_iata,
@@ -285,6 +330,8 @@ def normalize_flight(
         "scheduled_off_utc": scheduled_out_utc,  # FR24 no diferencia gate/wheels-up programado
         "scheduled_on_utc": scheduled_in_utc,
         "scheduled_in_utc": scheduled_in_utc,
+        "estimated_out_utc": estimated_out_utc,
+        "estimated_in_utc": estimated_in_utc,
         "crs_elapsed_min": crs_elapsed_min,
         "distance": None,  # FR24 no lo expone consistentemente
         "aircraft_type": ((aircraft.get("model") or {}).get("code")),

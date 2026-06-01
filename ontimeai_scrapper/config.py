@@ -27,6 +27,13 @@ GCS_BUCKET: str = os.getenv("GCS_BUCKET", "ontimeai-live-db")
 GCS_DB_BLOB: str = os.getenv("GCS_DB_BLOB", "live_data.db")
 LOCAL_DB_PATH: str = os.getenv("LOCAL_DB_PATH", "/tmp/live_data.db")
 
+# Future-leg capture (Fix #1): keep a tail's not-yet-id'd ATL legs from the chain
+# walk so the backend discovers departures hours ahead instead of ~1h. Default OFF
+# until the dry-run lead-time histogram validates the horizon gain. See
+# FUTURE_LEG_CAPTURE_DESIGN.md.
+CAPTURE_FUTURE_LEGS: bool = os.getenv("CAPTURE_FUTURE_LEGS", "false").lower() in ("1", "true", "yes")
+FUTURE_LEG_HORIZON_HOURS: int = int(os.getenv("FUTURE_LEG_HORIZON_HOURS", "12"))
+
 LINEAGE_FRESHNESS_HOURS: int = int(os.getenv("LINEAGE_FRESHNESS_HOURS", "6"))
 LINEAGE_MAX_CONSECUTIVE_FAILURES: int = int(os.getenv("LINEAGE_MAX_CONSECUTIVE_FAILURES", "5"))
 LINEAGE_HYDRATION_BUDGET: int = int(os.getenv("LINEAGE_HYDRATION_BUDGET", "30"))

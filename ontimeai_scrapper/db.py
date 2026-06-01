@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS flights (
     cancelled INTEGER,
     diverted INTEGER,
     first_seen_utc TEXT NOT NULL,
-    last_updated_utc TEXT NOT NULL
+    last_updated_utc TEXT NOT NULL,
+    estimated_out_utc TEXT,
+    estimated_in_utc TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_flights_date_dep ON flights(fl_date, scheduled_off_utc);
 CREATE INDEX IF NOT EXISTS idx_flights_tail ON flights(tail_num, scheduled_off_utc);
@@ -142,7 +144,28 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(BACKEND_SCHEMA)
     conn.executescript(HARVESTER_SCHEMA)
     _migrate_aircraft_position(conn)
+    _migrate_estimated_times(conn)
     conn.commit()
+
+
+def _migrate_estimated_times(conn: sqlite3.Connection) -> None:
+    """ALTER TABLE flights to add estimated_out_utc / estimated_in_utc.
+
+    CREATE TABLE IF NOT EXISTS won't add columns to an existing table. The
+    shared production DB already has these (the backend's _migrate_estimated_times
+    added them), so this is a no-op there; it only matters for harvester DBs that
+    predate this change. Mirrors the backend migration so both writers agree.
+    """
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(flights)").fetchall()}
+    except sqlite3.OperationalError:
+        return  # table doesn't exist yet; CREATE will handle it
+    if not cols:
+        return
+    if "estimated_out_utc" not in cols:
+        conn.execute("ALTER TABLE flights ADD COLUMN estimated_out_utc TEXT")
+    if "estimated_in_utc" not in cols:
+        conn.execute("ALTER TABLE flights ADD COLUMN estimated_in_utc TEXT")
 
 
 def _migrate_aircraft_position(conn: sqlite3.Connection) -> None:
@@ -204,14 +227,16 @@ def upsert_flights(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
         fl_date, crs_dep_min,
         scheduled_out_utc, scheduled_off_utc, scheduled_on_utc, scheduled_in_utc,
         crs_elapsed_min, distance, aircraft_type, cancelled, diverted,
-        first_seen_utc, last_updated_utc
+        first_seen_utc, last_updated_utc,
+        estimated_out_utc, estimated_in_utc
     ) VALUES (
         :fa_flight_id, :stable_id, :ident_iata, :op_carrier, :flight_number,
         :tail_num, :origin, :dest, :inbound_fa_flight_id,
         :fl_date, :crs_dep_min,
         :scheduled_out_utc, :scheduled_off_utc, :scheduled_on_utc, :scheduled_in_utc,
         :crs_elapsed_min, :distance, :aircraft_type, :cancelled, :diverted,
-        :first_seen, :last_updated
+        :first_seen, :last_updated,
+        :estimated_out_utc, :estimated_in_utc
     )
     ON CONFLICT(fa_flight_id) DO UPDATE SET
         stable_id = COALESCE(excluded.stable_id, flights.stable_id),
@@ -233,6 +258,8 @@ def upsert_flights(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
         aircraft_type = COALESCE(excluded.aircraft_type, flights.aircraft_type),
         cancelled = COALESCE(excluded.cancelled, flights.cancelled),
         diverted = COALESCE(excluded.diverted, flights.diverted),
+        estimated_out_utc = COALESCE(excluded.estimated_out_utc, flights.estimated_out_utc),
+        estimated_in_utc = COALESCE(excluded.estimated_in_utc, flights.estimated_in_utc),
         last_updated_utc = excluded.last_updated_utc
     """
     for row in rows:
@@ -259,6 +286,8 @@ def upsert_flights(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
             "aircraft_type": row.get("aircraft_type"),
             "cancelled": row.get("cancelled"),
             "diverted": row.get("diverted"),
+            "estimated_out_utc": row.get("estimated_out_utc"),
+            "estimated_in_utc": row.get("estimated_in_utc"),
             "first_seen": now,
             "last_updated": now,
         }
@@ -319,6 +348,80 @@ def upsert_actuals(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
         conn.execute(sql, params)
         count += 1
     return count
+
+
+def reconcile_synthetic_flights(
+    conn: sqlite3.Connection, *, ttl_hours: int = 3
+) -> dict[str, int]:
+    """Collapse SYN- placeholder flights (future-leg capture) against real-id rows.
+
+    A future leg captured from the chain walk gets a deterministic
+    ``SYN-{carrier}{flightnum}-{origin}-{dest}-{fl_date}`` id (FR24 leaves the real id
+    null until ~1h out). Once the same physical flight appears on the airport board with
+    a real FR24 id, this collapses the two: it repoints any predictions/actuals written
+    against the placeholder to the real id and deletes the placeholder, leaving one
+    ``flights`` row with full prediction history. Also TTL-purges placeholders whose
+    departure is well past and never matched a real id (cancelled / never boarded).
+
+    Idempotent. Safe to run every tick. Returns ``{"reconciled": n, "purged": n}``.
+    """
+    has_predictions = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='predictions'"
+    ).fetchone() is not None
+
+    # 1. Find (syn_id -> real_id) pairs sharing flight identity. Restrict to recent
+    #    fl_date so the self-join stays cheap (placeholders are always near-future).
+    pairs = conn.execute(
+        """
+        WITH ident AS (
+            SELECT fa_flight_id, op_carrier, flight_number, origin, dest, fl_date,
+                   (fa_flight_id LIKE 'SYN-%') AS is_syn
+            FROM flights
+            WHERE op_carrier IS NOT NULL AND flight_number IS NOT NULL
+              AND origin IS NOT NULL AND dest IS NOT NULL AND fl_date IS NOT NULL
+              AND fl_date >= date('now', '-1 day')
+        )
+        SELECT s.fa_flight_id AS syn_id, r.fa_flight_id AS real_id
+        FROM ident s
+        JOIN ident r
+          ON  s.op_carrier = r.op_carrier AND s.flight_number = r.flight_number
+          AND s.origin = r.origin AND s.dest = r.dest AND s.fl_date = r.fl_date
+        WHERE s.is_syn = 1 AND r.is_syn = 0
+        """
+    ).fetchall()
+
+    reconciled = 0
+    for row in pairs:
+        syn_id, real_id = row["syn_id"], row["real_id"]
+        # OR IGNORE: when the real id already has a row at the same key
+        # ((fa_flight_id, predicted_at_utc) / fa_flight_id PK), keep it and drop the
+        # placeholder's duplicate afterwards.
+        if has_predictions:
+            conn.execute(
+                "UPDATE OR IGNORE predictions SET fa_flight_id=? WHERE fa_flight_id=?",
+                (real_id, syn_id),
+            )
+            conn.execute("DELETE FROM predictions WHERE fa_flight_id=?", (syn_id,))
+        conn.execute(
+            "UPDATE OR IGNORE actuals SET fa_flight_id=? WHERE fa_flight_id=?",
+            (real_id, syn_id),
+        )
+        conn.execute("DELETE FROM actuals WHERE fa_flight_id=?", (syn_id,))
+        conn.execute("DELETE FROM flights WHERE fa_flight_id=?", (syn_id,))
+        reconciled += 1
+
+    # 2. TTL purge: stale placeholders that never matched a real id.
+    cur = conn.execute(
+        f"""
+        DELETE FROM flights
+        WHERE fa_flight_id LIKE 'SYN-%'
+          AND scheduled_out_utc IS NOT NULL
+          AND datetime(scheduled_out_utc) < datetime('now', '-{int(ttl_hours)} hours')
+        """
+    )
+    purged = cur.rowcount or 0
+    conn.commit()
+    return {"reconciled": reconciled, "purged": purged}
 
 
 def upsert_aircraft_positions(

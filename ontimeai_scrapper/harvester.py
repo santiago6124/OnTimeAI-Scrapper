@@ -403,6 +403,16 @@ def main() -> int:
                     error=chain_stats.error,
                 )
 
+        # Future-leg reconciliation (Fix #1): collapse SYN- placeholders against the
+        # real-id rows once Capa 1 sees the flight, and TTL-purge stale ones. Runs every
+        # tick regardless of CAPTURE_FUTURE_LEGS so leftover placeholders are always
+        # cleaned up even after the flag is turned off.
+        if not args.dry_run:
+            recon = db.reconcile_synthetic_flights(conn)
+            if recon["reconciled"] or recon["purged"]:
+                log.info("reconcile_synthetic: reconciled=%d purged=%d",
+                         recon["reconciled"], recon["purged"])
+
     log.info(
         "DONE capa1=%s pages=%s calls=%d flights=%d actuals=%d tails_seen=%d adsb=%d duration=%.1fs status=%s",
         stats.layer,

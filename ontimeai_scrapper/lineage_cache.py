@@ -79,8 +79,12 @@ def maybe_hydrate_tail(
     freshness_hours: int = config.LINEAGE_FRESHNESS_HOURS,
     max_failures: int = config.LINEAGE_MAX_CONSECUTIVE_FAILURES,
     limit: int = config.FR24_HISTORY_DEFAULT_LIMIT,
+    capture_future_legs: bool = config.CAPTURE_FUTURE_LEGS,
 ) -> tuple[HydrationStatus, int, int]:
     """Hidrata el historial de un tail si está stale. Idempotente vía cache.
+
+    Con capture_future_legs, además del historial retiene las piernas ATL futuras
+    del itinerario (placeholders sintéticos) para adelantar el descubrimiento.
 
     Returns: (status, n_flights_upserted, n_actuals_upserted)
     """
@@ -113,7 +117,7 @@ def maybe_hydrate_tail(
     # Fetch
     try:
         _raw, flights_rows, actuals_rows = fetch_aircraft_history(
-            fr24_client, tail, limit=limit
+            fr24_client, tail, limit=limit, capture_future_legs=capture_future_legs
         )
     except FR24EmptyResponseError:
         _bump_cache(conn, tail, ok=True, source="fr24", now=now)
