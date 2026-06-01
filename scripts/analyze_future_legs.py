@@ -100,8 +100,8 @@ def main() -> int:
         f"Legs >2h ahead: {100 * sum(1 for x in leads if x > 120) / n:.0f}%  |  "
         f">4h ahead: {100 * sum(1 for x in leads if x > 240) / n:.0f}%"
     )
-    verdict = "PASS — enable CAPTURE_FUTURE_LEGS" if median >= 120 else "BELOW GATE — keep flag off"
-    print(f"Airport-board horizon ≈ 75 min. Gate: median >= 120 min → {verdict}")
+    verdict = "PASS - enable CAPTURE_FUTURE_LEGS" if median >= 120 else "BELOW GATE - keep flag off"
+    print(f"Airport-board horizon ~75 min. Gate: median >= 120 min -> {verdict}")
     return 0
 
 

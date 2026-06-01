@@ -147,6 +147,53 @@ flights, so `SYN-` ATL departures get predicted as soon as they're discovered.
 
 ## 8. Rollout
 
-Behind `CAPTURE_FUTURE_LEGS` env flag (default off). Enable in `--dry-run` first, inspect the
-lead-time histogram, then turn on writes. Reconciliation runs regardless so any stray `SYN-`
-rows are always cleaned.
+Behind `CAPTURE_FUTURE_LEGS` env flag (default off). Validate with the dry-run first, inspect
+the lead-time histogram, then turn on writes. Reconciliation (`db.reconcile_synthetic_flights`)
+runs every tick **regardless** of the flag, so any stray `SYN-` rows are always cleaned even
+after turning it off.
+
+## 9. Measured results (2026-06-01)
+
+Dry-run `python -m scripts.analyze_future_legs --tails 30` against live FR24:
+
+```
+Future ATL legs captured: 31 (from 30 tails, ~1.0/tail)
+Lead time (min ahead of now): min=338 p25=458 median=521 p75=608 p90=647 max=717
+Legs >2h ahead: 100%  |  >4h ahead: 100%
+Gate: median >= 120 min -> PASS
+```
+
+**Median lead ≈ 8.7 h** vs the ~75 min airport board. End-to-end test (capture →
+`upsert_flights` → `reconcile_synthetic_flights` on a throwaway DB copy) landed 12 synthetic
+ATL departures with no crashes; reconcile clean (0 collapsed — none on the board yet).
+
+### Interaction with the backend horizon (important)
+The captured legs sit at ~6–11 h out, but the backend Fix 1 target query defaults to a **6 h**
+horizon (`PREDICT_HORIZON_HOURS`). Measured on the test DB:
+
+| Backend horizon | SYN ATL deps predicted |
+|---|---|
+| 6 h  | 1 |
+| 8 h  | 3 |
+| 12 h | 12 (all) |
+
+**To capitalise on capture, the two flags must be enabled together:**
+1. Harvester job: `CAPTURE_FUTURE_LEGS=true`
+2. Backend job: `PREDICT_HORIZON_HOURS=12`
+
+Otherwise legs at 6–12 h are discovered but not predicted until they slip inside 6 h.
+
+## 10. Status / files
+
+Implemented, validated, **flag off** pending enablement.
+
+| File | Change |
+|---|---|
+| `fr24_client.py` | `_synthetic_id` + `normalize_flight(allow_synthetic_id=)` |
+| `fr24_http.py` | `fetch_aircraft_history(capture_future_legs=)` + `_is_future_atl_leg` |
+| `lineage_cache.py` | thread flag into `maybe_hydrate_tail` |
+| `db.py` | `reconcile_synthetic_flights` |
+| `harvester.py` | call reconcile each tick |
+| `config.py` | `CAPTURE_FUTURE_LEGS`, `FUTURE_LEG_HORIZON_HOURS` |
+| `scripts/analyze_future_legs.py` | dry-run lead-time histogram (writes nothing) |
+| `tests/test_future_legs.py` | synthetic-id, filter, reconciliation |

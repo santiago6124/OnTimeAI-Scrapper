@@ -26,6 +26,7 @@ Detalle completo: ver `OnTimeAI-Backend/PLAN_HARVESTER_LINEAGE.md`.
 - [x] **Fase 2 — Chain walk lazy (Capa 2)** — DEPLOYED 2026-05-22, FR24 inbound coverage 92.3%
 - [ ] **Fase 3 — Refresh activo + FAA + fallback OpenSky** — `[TODO]` no urgente
 - [~] **Fase 4 — Switch del live_pull.py** — código deployed, BLOCKED por bug LightGBM SIGSEGV preexistente en backend
+- [x] **Lead time fixes (2026-06-01)** — captura de `estimated_*` + future-legs (flag `CAPTURE_FUTURE_LEGS`, off). Dry-run: lead mediana ~8.7h. Ver `HARVESTER_FIXES.md` y `FUTURE_LEG_CAPTURE_DESIGN.md`
 
 Documentación completa de hallazgos: `SESSION_HALLAZGOS.md`
 
@@ -59,6 +60,8 @@ python scripts/validate_sources.py --all
 | `FR24_THROTTLE_SECONDS` | `1.5` | Delay mínimo entre calls a FR24 |
 | `OPENSKY_USERNAME` | (vacío = anónimo) | Cuenta OpenSky para fallback (recomendado) |
 | `OPENSKY_PASSWORD` | (vacío) | Password OpenSky |
+| `CAPTURE_FUTURE_LEGS` | `false` | Retener las salidas ATL futuras del chain-walk (lead time ~8.7h). Activar junto con `PREDICT_HORIZON_HOURS=12` en el backend. Ver `FUTURE_LEG_CAPTURE_DESIGN.md` |
+| `FUTURE_LEG_HORIZON_HOURS` | `12` | Horizonte máx. para retener future-legs |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 
 ---

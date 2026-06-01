@@ -91,6 +91,43 @@ retorna lista vacía, harvester sigue normal.
 
 ---
 
+## Aplicado 2026-06-01 — lead time de predicción
+
+**Contexto**: el backend predecía cada vuelo ~1 vez, mediana ~4 min antes del pushback,
+porque el descubrimiento (airport boards de AeroAPI **y** FR24) sólo expone vuelos ~75 min
+antes de salir. Dos fixes en el scrapper para destrabar lead time real. Detalle backend:
+`OnTimeAI-Backend/PREDICTION_LEAD_TIME_FIX.md`.
+
+### Fix #2 — capturar tiempos `estimated` de FR24
+**Archivos**: `fr24_client.py`, `db.py`.
+
+`normalize_flight` descartaba el bloque `time.estimated` de FR24. Ahora lo lee →
+`estimated_out_utc` / `estimated_in_utc`, columnas nuevas en `flights` (con
+`_migrate_estimated_times`, no-op en la DB de prod que ya las tiene por el backend) y
+cableadas en `upsert_flights`. Alimenta el predicado delay-aware del backend
+`COALESCE(estimated_out_utc, scheduled_out_utc)`.
+
+### Fix #1 — capturar future-legs del chain-walk (detrás de flag)
+**Archivos**: `fr24_client.py`, `fr24_http.py`, `lineage_cache.py`, `db.py`, `harvester.py`,
+`config.py`. Diseño completo: **`FUTURE_LEG_CAPTURE_DESIGN.md`**.
+
+El chain-walk (`flight/list.json`) ya trae el itinerario **futuro** de cada tail, pero se
+descartaba porque FR24 deja `id==null` hasta ~1h antes. Ahora, con
+`CAPTURE_FUTURE_LEGS=true`, esas legs ATL futuras se retienen con un id sintético
+determinístico `SYN-{carrier}{num}-{origin}-{dest}-{fl_date}`; `reconcile_synthetic_flights`
+las colapsa contra el row con id real cuando aparece en el board (repunta predicciones/actuals
+al id real, TTL-purga las que nunca matchean). Corre cada tick **aunque el flag esté off**.
+
+**Dry-run validado (real FR24)**: 30 tails → 31 future-legs ATL, **lead mediana 521 min
+(~8.7h)**, 100% >4h. Gate (≥120 min) **PASS**. Herramienta: `scripts/analyze_future_legs.py`
+(no escribe nada). Tests: `tests/test_future_legs.py`.
+
+> ⚠️ **Activar junto con el backend**: `CAPTURE_FUTURE_LEGS=true` **y**
+> `PREDICT_HORIZON_HOURS=12` en el job del backend. Con 6h sólo se predice ~1 leg por lote
+> (las demás caen a 6–12h). Ver `FUTURE_LEG_CAPTURE_DESIGN.md` §9.
+
+---
+
 ## Pendientes (priorizado por ROI)
 
 ### Tier H1 — Datos nuevos para el modelo
