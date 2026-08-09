@@ -285,9 +285,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-
+def _run_once(args: argparse.Namespace) -> int:
+    base_generation: int | None = None
     if args.local_db:
         local_path = Path(args.local_db)
         if not local_path.parent.exists():
@@ -297,7 +296,7 @@ def main() -> int:
                 pass  # crea schema en archivo vacío
         log.info("using local DB: %s", local_path)
     else:
-        local_path = db.download_db_from_gcs()
+        local_path, base_generation = db.download_db_snapshot_from_gcs()
 
     # Cliente FR24 compartido entre Capa 1 y Capa 2 — reusa la sesión curl_cffi
     # (cookies + TLS impersonation) que pasa Cloudflare en un solo warm-up.
@@ -444,13 +443,43 @@ def main() -> int:
         log.info("skip upload (local_db=%s dry_run=%s skip_upload=%s)",
                  bool(args.local_db), args.dry_run, args.skip_upload)
     else:
-        db.upload_db_to_gcs(local_path)
+        if base_generation is None:
+            raise RuntimeError("missing GCS base generation for guarded upload")
+        db.upload_db_to_gcs(
+            local_path,
+            expected_generation=base_generation,
+        )
 
     if stats.status == "failed":
         return 2
     if stats.status == "partial":
         return 1
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    generation_retries = max(0, int(os.getenv("GCS_GENERATION_RETRIES", "2")))
+
+    for attempt in range(generation_retries + 1):
+        try:
+            return _run_once(args)
+        except db.GCSGenerationConflict as exc:
+            if attempt >= generation_retries:
+                log.error(
+                    "generation conflict after %d attempts; refusing stale overwrite: %s",
+                    attempt + 1,
+                    exc,
+                )
+                return 3
+            log.warning(
+                "generation conflict: %s; reloading winning DB and retrying (%d/%d)",
+                exc,
+                attempt + 2,
+                generation_retries + 1,
+            )
+
+    return 3
 
 
 if __name__ == "__main__":

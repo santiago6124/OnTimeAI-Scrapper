@@ -5,9 +5,9 @@ El harvester comparte `live_data.db` con OnTimeAI-Backend. Schema de `flights`,
 (ver ontimeai/live.py). Acá solo replicamos esos CREATE TABLE IF NOT EXISTS
 (idempotente) y agregamos las tablas nuevas del harvester.
 
-Concurrencia: si el live_pull del backend corre simultáneamente, el último
-upload gana. Mitigación: staggear crons (live_pull cada 30min en :00/:30,
-harvester cada 15min en :05/:20/:35/:50). Pérdida tolerable: hasta 1 tick.
+Concurrencia: todos los escritores usan la generación descargada como
+precondición del upload. Si otro job publica primero, el upload obsoleto falla
+y el harvester reinicia desde la generación ganadora; nunca hace last-write-wins.
 """
 
 from __future__ import annotations
@@ -496,33 +496,98 @@ def _gcs_client():
     return storage.Client(project=config.GCP_PROJECT) if config.GCP_PROJECT else storage.Client()
 
 
-def download_db_from_gcs(local_path: str | Path = config.LOCAL_DB_PATH) -> Path:
-    """Descarga gs://{GCS_BUCKET}/{GCS_DB_BLOB} a local_path. Si no existe en GCS, crea archivo vacío."""
+class GCSGenerationConflict(RuntimeError):
+    """The shared DB changed after this process selected its base generation."""
+
+
+def _gcs_blob():
+    client = _gcs_client()
+    return client.bucket(config.GCS_BUCKET).blob(config.GCS_DB_BLOB)
+
+
+def download_db_snapshot_from_gcs(
+    local_path: str | Path = config.LOCAL_DB_PATH,
+) -> tuple[Path, int]:
+    """Download one immutable GCS generation and return ``(path, generation)``.
+
+    Generation ``0`` means the object did not exist when the snapshot was
+    selected.  A later upload with ``if_generation_match=0`` may create it but
+    cannot overwrite an object created concurrently.
+    """
+    from google.api_core.exceptions import NotFound, PreconditionFailed
+
     local = Path(local_path)
     local.parent.mkdir(parents=True, exist_ok=True)
-    client = _gcs_client()
-    bucket = client.bucket(config.GCS_BUCKET)
-    blob = bucket.blob(config.GCS_DB_BLOB)
-    if not blob.exists():
+    blob = _gcs_blob()
+    try:
+        blob.reload()
+    except NotFound:
         log.warning("DB no existe en gs://%s/%s — creando archivo vacío", config.GCS_BUCKET, config.GCS_DB_BLOB)
         local.write_bytes(b"")
         with open_db(local):  # crea schema en archivo vacío
             pass
-        return local
-    log.info("downloading gs://%s/%s -> %s", config.GCS_BUCKET, config.GCS_DB_BLOB, local)
-    blob.download_to_filename(str(local))
-    log.info("downloaded %d bytes", local.stat().st_size)
+        return local, 0
+
+    generation = int(blob.generation)
+    log.info(
+        "downloading gs://%s/%s generation=%d -> %s",
+        config.GCS_BUCKET,
+        config.GCS_DB_BLOB,
+        generation,
+        local,
+    )
+    try:
+        blob.download_to_filename(
+            str(local),
+            if_generation_match=generation,
+        )
+    except PreconditionFailed as exc:
+        raise GCSGenerationConflict(
+            f"la DB cambió durante la descarga de generation={generation}"
+        ) from exc
+    log.info("downloaded %d bytes (generation=%d)", local.stat().st_size, generation)
+    return local, generation
+
+
+def download_db_from_gcs(local_path: str | Path = config.LOCAL_DB_PATH) -> Path:
+    """Backward-compatible read-only helper that returns only the local path."""
+    local, _generation = download_db_snapshot_from_gcs(local_path)
     return local
 
 
-def upload_db_to_gcs(local_path: str | Path = config.LOCAL_DB_PATH) -> None:
-    """Sube local_path a gs://{GCS_BUCKET}/{GCS_DB_BLOB}. Pisa la versión anterior."""
+def upload_db_to_gcs(
+    local_path: str | Path = config.LOCAL_DB_PATH,
+    *,
+    expected_generation: int,
+) -> int:
+    """Upload only if GCS still contains ``expected_generation``."""
+    from google.api_core.exceptions import PreconditionFailed
+
     local = Path(local_path)
     if not local.exists():
         raise FileNotFoundError(f"local DB no existe: {local}")
-    client = _gcs_client()
-    bucket = client.bucket(config.GCS_BUCKET)
-    blob = bucket.blob(config.GCS_DB_BLOB)
-    log.info("uploading %s -> gs://%s/%s", local, config.GCS_BUCKET, config.GCS_DB_BLOB)
-    blob.upload_from_filename(str(local))
-    log.info("upload OK (%d bytes)", local.stat().st_size)
+    blob = _gcs_blob()
+    log.info(
+        "uploading %s -> gs://%s/%s if_generation_match=%d",
+        local,
+        config.GCS_BUCKET,
+        config.GCS_DB_BLOB,
+        expected_generation,
+    )
+    try:
+        blob.upload_from_filename(
+            str(local),
+            if_generation_match=expected_generation,
+        )
+    except PreconditionFailed as exc:
+        raise GCSGenerationConflict(
+            f"GCS ya no está en generation={expected_generation}"
+        ) from exc
+    uploaded_generation = int(blob.generation)
+    log.info(
+        "upload OK (%d bytes, generation=%d, base=%d)",
+        local.stat().st_size,
+        uploaded_generation,
+        expected_generation,
+    )
+    return uploaded_generation
