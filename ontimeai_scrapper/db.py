@@ -62,6 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_flights_carrier ON flights(op_carrier, scheduled_
 CREATE TABLE IF NOT EXISTS actuals (
     fa_flight_id TEXT PRIMARY KEY,
     stable_id TEXT,
+    source_provider TEXT,
     actual_out_utc TEXT,
     actual_off_utc TEXT,
     actual_on_utc TEXT,
@@ -145,6 +146,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(HARVESTER_SCHEMA)
     _migrate_aircraft_position(conn)
     _migrate_estimated_times(conn)
+    _migrate_actuals_provenance(conn)
     conn.commit()
 
 
@@ -166,6 +168,16 @@ def _migrate_estimated_times(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE flights ADD COLUMN estimated_out_utc TEXT")
     if "estimated_in_utc" not in cols:
         conn.execute("ALTER TABLE flights ADD COLUMN estimated_in_utc TEXT")
+
+
+def _migrate_actuals_provenance(conn: sqlite3.Connection) -> None:
+    """Keep the upstream outcome provider compatible with the backend schema."""
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(actuals)").fetchall()}
+    except sqlite3.OperationalError:
+        return
+    if cols and "source_provider" not in cols:
+        conn.execute("ALTER TABLE actuals ADD COLUMN source_provider TEXT")
 
 
 def _migrate_aircraft_position(conn: sqlite3.Connection) -> None:
@@ -302,18 +314,19 @@ def upsert_actuals(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
     count = 0
     sql = """
     INSERT INTO actuals (
-        fa_flight_id, stable_id,
+        fa_flight_id, stable_id, source_provider,
         actual_out_utc, actual_off_utc, actual_on_utc, actual_in_utc,
         arr_delay_min, departure_delay_min,
         cancelled, diverted, settled_at_utc
     ) VALUES (
-        :fa_flight_id, :stable_id,
+        :fa_flight_id, :stable_id, :source_provider,
         :actual_out_utc, :actual_off_utc, :actual_on_utc, :actual_in_utc,
         :arr_delay_min, :departure_delay_min,
         :cancelled, :diverted, :settled_at_utc
     )
     ON CONFLICT(fa_flight_id) DO UPDATE SET
         stable_id = COALESCE(excluded.stable_id, actuals.stable_id),
+        source_provider = COALESCE(excluded.source_provider, actuals.source_provider),
         actual_out_utc = COALESCE(excluded.actual_out_utc, actuals.actual_out_utc),
         actual_off_utc = COALESCE(excluded.actual_off_utc, actuals.actual_off_utc),
         actual_on_utc = COALESCE(excluded.actual_on_utc, actuals.actual_on_utc),
@@ -335,6 +348,7 @@ def upsert_actuals(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
         params = {
             "fa_flight_id": row["fa_flight_id"],
             "stable_id": row.get("stable_id"),
+            "source_provider": row.get("source_provider") or "fr24",
             "actual_out_utc": row.get("actual_out_utc"),
             "actual_off_utc": row.get("actual_off_utc"),
             "actual_on_utc": row.get("actual_on_utc"),

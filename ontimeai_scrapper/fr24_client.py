@@ -375,6 +375,7 @@ def normalize_actual(flight: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "fa_flight_id": fa_flight_id,
         "stable_id": fa_flight_id,
+        "source_provider": "fr24",
         "actual_out_utc": None,  # FR24 no expone gate-out, solo wheels-up
         "actual_off_utc": _epoch_to_iso(actual_off_epoch),
         "actual_on_utc": _epoch_to_iso(actual_in_epoch),  # aprox: touchdown == gate-in en FR24
