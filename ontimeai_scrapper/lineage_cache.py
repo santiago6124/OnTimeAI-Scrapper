@@ -41,6 +41,73 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def pending_outcome_tails(
+    conn: sqlite3.Connection,
+    *,
+    grace_minutes: int = config.PENDING_OUTCOME_GRACE_MINUTES,
+    lookback_hours: int = config.PENDING_OUTCOME_LOOKBACK_HOURS,
+) -> set[str]:
+    """Tails with predicted flights whose expected arrival passed without an actual."""
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT f.tail_num
+            FROM predictions p
+            JOIN flights f ON f.fa_flight_id = p.fa_flight_id
+            LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+            WHERE f.tail_num IS NOT NULL AND f.tail_num <> ''
+              AND COALESCE(f.cancelled, 0) = 0
+              AND a.actual_in_utc IS NULL
+              AND COALESCE(f.estimated_in_utc, f.scheduled_in_utc) IS NOT NULL
+              AND datetime(COALESCE(f.estimated_in_utc, f.scheduled_in_utc))
+                    <= datetime('now', '-{int(grace_minutes)} minutes')
+              AND datetime(COALESCE(f.estimated_in_utc, f.scheduled_in_utc))
+                    >= datetime('now', '-{int(lookback_hours)} hours')
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row[0]).strip().upper() for row in rows if row[0]}
+
+
+def pending_outcome_tail_order(
+    conn: sqlite3.Connection,
+    *,
+    grace_minutes: int = config.PENDING_OUTCOME_GRACE_MINUTES,
+    lookback_hours: int = config.PENDING_OUTCOME_LOOKBACK_HOURS,
+) -> list[str]:
+    """Pending tails ordered by the oldest unresolved expected arrival first."""
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT f.tail_num,
+                   MIN(datetime(COALESCE(f.estimated_in_utc, f.scheduled_in_utc))) AS due_at,
+                   cache.hydrated_until AS last_refresh
+            FROM predictions p
+            JOIN flights f ON f.fa_flight_id = p.fa_flight_id
+            LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+            LEFT JOIN tail_lineage_cache cache ON cache.tail = f.tail_num
+            WHERE f.tail_num IS NOT NULL AND f.tail_num <> ''
+              AND COALESCE(f.cancelled, 0) = 0
+              AND a.actual_in_utc IS NULL
+              AND COALESCE(f.estimated_in_utc, f.scheduled_in_utc) IS NOT NULL
+              AND datetime(COALESCE(f.estimated_in_utc, f.scheduled_in_utc))
+                    <= datetime('now', '-{int(grace_minutes)} minutes')
+              AND datetime(COALESCE(f.estimated_in_utc, f.scheduled_in_utc))
+                    >= datetime('now', '-{int(lookback_hours)} hours')
+            GROUP BY f.tail_num
+            -- Fair queue: never/least-recently refreshed tails go first.  If we
+            -- sorted only by due_at, permanently missing flights would consume
+            -- the first budget slots every hour and starve newer long-hauls.
+            ORDER BY COALESCE(last_refresh, '1970-01-01T00:00:00+00:00') ASC,
+                     due_at ASC, f.tail_num ASC
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [str(row[0]).strip().upper() for row in rows if row[0]]
+
+
 def _adaptive_freshness_hours(
     conn: sqlite3.Connection, tail: str, default_hours: int
 ) -> int:
@@ -80,6 +147,7 @@ def maybe_hydrate_tail(
     max_failures: int = config.LINEAGE_MAX_CONSECUTIVE_FAILURES,
     limit: int = config.FR24_HISTORY_DEFAULT_LIMIT,
     capture_future_legs: bool = config.CAPTURE_FUTURE_LEGS,
+    force_refresh: bool = False,
 ) -> tuple[HydrationStatus, int, int]:
     """Hidrata el historial de un tail si está stale. Idempotente vía cache.
 
@@ -109,7 +177,7 @@ def maybe_hydrate_tail(
         except (TypeError, ValueError):
             hydrated_until = now - timedelta(days=365)
 
-        if hydrated_until > now - timedelta(hours=effective_freshness):
+        if not force_refresh and hydrated_until > now - timedelta(hours=effective_freshness):
             return HydrationStatus.HIT_CACHE, 0, 0
         if (row["consecutive_failures"] or 0) >= max_failures:
             return HydrationStatus.SKIPPED_FAILURES, 0, 0
@@ -277,8 +345,12 @@ def select_tails_to_hydrate(
     except Exception:  # noqa: BLE001 - tolerate missing table in early bootstrap
         pass
 
+    pending_outcome_order = pending_outcome_tail_order(conn)
+    pending_outcomes = set(pending_outcome_order)
+
     now = _now()
     bootstrap_pending: list[str] = []
+    pending_outcome_list: list[str] = []
     predicted_today_list: list[str] = []
     high_freq: list[str] = []
     never: list[str] = []
@@ -293,6 +365,27 @@ def select_tails_to_hydrate(
         # for this tail; we should not let ADS-B noise outrank it.
         if crow is not None and (crow["last_pull_source"] or "") == "bootstrap-request":
             bootstrap_pending.append(t)
+            continue
+
+        # A predicted flight that should already have arrived bypasses the
+        # adaptive 6-24h lineage TTL, but still observes a smaller retry interval
+        # so a delayed flight does not consume one FR24 call every harvester tick.
+        if t in pending_outcomes:
+            if crow is None:
+                pending_outcome_list.append(t)
+                continue
+            try:
+                hu = datetime.fromisoformat(crow["hydrated_until"])
+                if hu.tzinfo is None:
+                    hu = hu.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pending_outcome_list.append(t)
+                continue
+            refresh_before = now - timedelta(minutes=config.PENDING_OUTCOME_REFRESH_MINUTES)
+            if (hu < refresh_before
+                    and (crow["consecutive_failures"] or 0)
+                    < config.LINEAGE_MAX_CONSECUTIVE_FAILURES):
+                pending_outcome_list.append(t)
             continue
 
         # Predicted-today = second highest. We're going to score this tail
@@ -330,7 +423,12 @@ def select_tails_to_hydrate(
                 < config.LINEAGE_MAX_CONSECUTIVE_FAILURES):
             (high_freq if ttl_hours <= 2 else expired).append(t)
 
-    ordered = bootstrap_pending + predicted_today_list + high_freq + never + expired
+    pending_rank = {tail: index for index, tail in enumerate(pending_outcome_order)}
+    pending_outcome_list.sort(key=lambda tail: pending_rank.get(tail, len(pending_rank)))
+    ordered = (
+        bootstrap_pending + pending_outcome_list + predicted_today_list
+        + high_freq + never + expired
+    )
     return ordered[:budget]
 
 

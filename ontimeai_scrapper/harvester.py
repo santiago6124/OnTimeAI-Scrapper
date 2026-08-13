@@ -34,6 +34,7 @@ from .fr24_client import (
 from .lineage_cache import (
     HydrationStatus,
     maybe_hydrate_tail,
+    pending_outcome_tails,
     purge_stale_cache,
     select_tails_to_hydrate,
 )
@@ -148,6 +149,10 @@ def expand_candidate_tails(conn, base_tails: set[str], *, stale_hours: int = 24,
     """
     out = set(base_tails)
 
+    # Keep long-haul and other already-predicted flights on a settlement loop
+    # after they leave the airport board and the backend's short actuals window.
+    out.update(pending_outcome_tails(conn))
+
     # Bootstrap-requested + stale-cache tails
     rows = conn.execute(
         f"""
@@ -194,6 +199,7 @@ def harvest_chain_walk(
     to_hydrate = select_tails_to_hydrate(
         conn, candidate_tails, budget=budget, freshness_hours=freshness_hours
     )
+    pending_outcomes = pending_outcome_tails(conn)
     stats.cache_hits = len(candidate_tails) - len(to_hydrate)
 
     log.info(
@@ -208,7 +214,8 @@ def harvest_chain_walk(
     for tail in to_hydrate:
         try:
             status, n_f, n_a = maybe_hydrate_tail(
-                conn, client, tail, freshness_hours=freshness_hours
+                conn, client, tail, freshness_hours=freshness_hours,
+                force_refresh=tail in pending_outcomes,
             )
         except Exception as exc:  # noqa: BLE001 — proteger el loop del job
             log.exception("chain_walk(%s) crashed: %s", tail, exc)
@@ -411,6 +418,10 @@ def _run_once(args: argparse.Namespace) -> int:
             if recon["reconciled"] or recon["purged"]:
                 log.info("reconcile_synthetic: reconciled=%d purged=%d",
                          recon["reconciled"], recon["purged"])
+            alias_recon = db.reconcile_fr24_flight_aliases(conn)
+            if alias_recon["reconciled"] or alias_recon["conflicts"]:
+                log.info("reconcile_fr24_aliases: reconciled=%d conflicts=%d",
+                         alias_recon["reconciled"], alias_recon["conflicts"])
 
     log.info(
         "DONE capa1=%s pages=%s calls=%d flights=%d actuals=%d tails_seen=%d adsb=%d duration=%.1fs status=%s",

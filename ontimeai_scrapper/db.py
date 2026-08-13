@@ -86,6 +86,18 @@ CREATE TABLE IF NOT EXISTS tail_lineage_cache (
 CREATE INDEX IF NOT EXISTS idx_tail_lineage_hydrated_until
     ON tail_lineage_cache(hydrated_until);
 
+-- FR24 can replace the live-tracking id when it closes a flight.  Preserve the
+-- upstream alias while keeping predictions and actuals on one canonical id.
+CREATE TABLE IF NOT EXISTS flight_id_aliases (
+    alias_fa_flight_id TEXT PRIMARY KEY,
+    canonical_fa_flight_id TEXT NOT NULL,
+    source_provider TEXT NOT NULL,
+    scheduled_out_utc TEXT,
+    reconciled_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_flight_id_aliases_canonical
+    ON flight_id_aliases(canonical_fa_flight_id);
+
 CREATE TABLE IF NOT EXISTS tail_to_icao24_lookup (
     icao24 TEXT PRIMARY KEY,
     n_number TEXT NOT NULL,
@@ -228,6 +240,19 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def _canonical_flight_id(conn: sqlite3.Connection, fa_flight_id: str) -> str:
+    """Resolve a previously reconciled provider alias without mutating callers."""
+    try:
+        row = conn.execute(
+            "SELECT canonical_fa_flight_id FROM flight_id_aliases "
+            "WHERE alias_fa_flight_id = ?",
+            (fa_flight_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return fa_flight_id
+    return str(row[0]) if row else fa_flight_id
+
+
 def upsert_flights(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> int:
     """UPSERT en flights. `rows` deben tener al menos fa_flight_id. Devuelve count escrito."""
     now = _now_iso()
@@ -277,9 +302,11 @@ def upsert_flights(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
     for row in rows:
         if not row.get("fa_flight_id"):
             continue
+        source_id = str(row["fa_flight_id"])
+        canonical_id = _canonical_flight_id(conn, source_id)
         params = {
-            "fa_flight_id": row["fa_flight_id"],
-            "stable_id": row.get("stable_id"),
+            "fa_flight_id": canonical_id,
+            "stable_id": canonical_id if canonical_id != source_id else row.get("stable_id"),
             "ident_iata": row.get("ident_iata"),
             "op_carrier": row.get("op_carrier"),
             "flight_number": row.get("flight_number"),
@@ -345,9 +372,11 @@ def upsert_actuals(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
         )
         if not has_any_actual:
             continue
+        source_id = str(row["fa_flight_id"])
+        canonical_id = _canonical_flight_id(conn, source_id)
         params = {
-            "fa_flight_id": row["fa_flight_id"],
-            "stable_id": row.get("stable_id"),
+            "fa_flight_id": canonical_id,
+            "stable_id": canonical_id if canonical_id != source_id else row.get("stable_id"),
             "source_provider": row.get("source_provider") or "fr24",
             "actual_out_utc": row.get("actual_out_utc"),
             "actual_off_utc": row.get("actual_off_utc"),
@@ -436,6 +465,211 @@ def reconcile_synthetic_flights(
     purged = cur.rowcount or 0
     conn.commit()
     return {"reconciled": reconciled, "purged": purged}
+
+
+def _looks_like_fr24_id(value: str | None) -> bool:
+    """FR24 live ids are eight hexadecimal characters (unlike AeroAPI ids)."""
+    if value is None or len(str(value)) != 8:
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in str(value))
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _actual_rows_conflict(left: sqlite3.Row | None, right: sqlite3.Row | None) -> bool:
+    """Refuse to collapse aliases when both already carry incompatible labels."""
+    if left is None or right is None:
+        return False
+    left_delay = left["arr_delay_min"]
+    right_delay = right["arr_delay_min"]
+    if left_delay is None or right_delay is None:
+        return False
+    return abs(float(left_delay) - float(right_delay)) > 5.0
+
+
+def reconcile_fr24_flight_aliases(
+    conn: sqlite3.Connection, *, lookback_hours: int = 72
+) -> dict[str, int]:
+    """Collapse changed FR24 ids for the same physical flight.
+
+    FR24 occasionally exposes one id while a flight is live and a different id
+    after landing.  The match is deliberately strict: both ids must be native
+    eight-character FR24 ids and share tail, flight number, route and scheduled
+    departure minute.  The row with prediction history wins as the canonical id;
+    otherwise the oldest observed row wins.  Conflicting settled labels are left
+    untouched for manual review.
+
+    The alias is persisted in ``flight_id_aliases`` so later refreshes write
+    directly to the canonical id instead of recreating the duplicate.
+    """
+    has_predictions = _table_exists(conn, "predictions")
+    has_shap = _table_exists(conn, "prediction_shap")
+    prediction_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()
+    } if has_predictions else set()
+
+    rows = conn.execute(
+        f"""
+        SELECT fa_flight_id, stable_id, ident_iata, op_carrier, flight_number,
+               tail_num, origin, dest, inbound_fa_flight_id, fl_date, crs_dep_min,
+               scheduled_out_utc, scheduled_off_utc, scheduled_on_utc,
+               scheduled_in_utc, crs_elapsed_min, distance, aircraft_type,
+               cancelled, diverted, first_seen_utc, last_updated_utc,
+               estimated_out_utc, estimated_in_utc
+        FROM flights
+        WHERE tail_num IS NOT NULL AND tail_num <> ''
+          AND origin IS NOT NULL AND dest IS NOT NULL
+          AND scheduled_out_utc IS NOT NULL
+          AND datetime(scheduled_out_utc) >= datetime('now', '-{int(lookback_hours)} hours')
+        """
+    ).fetchall()
+
+    prediction_counts: dict[str, int] = {}
+    if has_predictions:
+        prediction_counts = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT fa_flight_id, COUNT(*) FROM predictions GROUP BY fa_flight_id"
+            ).fetchall()
+        }
+
+    groups: dict[tuple[str, str, str, str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        flight_id = str(row["fa_flight_id"])
+        if not _looks_like_fr24_id(flight_id):
+            continue
+        ident = (row["ident_iata"] or "").strip().upper()
+        if not ident:
+            ident = f"{row['op_carrier'] or ''}{row['flight_number'] or ''}".upper()
+        if not ident:
+            continue
+        try:
+            scheduled_minute = datetime.fromisoformat(
+                str(row["scheduled_out_utc"]).replace("Z", "+00:00")
+            ).strftime("%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+        key = (
+            str(row["tail_num"]).strip().upper(), ident,
+            str(row["origin"]).upper(), str(row["dest"]).upper(), scheduled_minute,
+        )
+        groups.setdefault(key, []).append(row)
+
+    reconciled = 0
+    conflicts = 0
+    for duplicates in groups.values():
+        if len(duplicates) < 2:
+            continue
+        canonical = min(
+            duplicates,
+            key=lambda row: (
+                -prediction_counts.get(str(row["fa_flight_id"]), 0),
+                row["first_seen_utc"] or "9999",
+                str(row["fa_flight_id"]),
+            ),
+        )
+        canonical_id = str(canonical["fa_flight_id"])
+
+        for alias in duplicates:
+            alias_id = str(alias["fa_flight_id"])
+            if alias_id == canonical_id:
+                continue
+            canonical_actual = conn.execute(
+                "SELECT * FROM actuals WHERE fa_flight_id=?", (canonical_id,)
+            ).fetchone()
+            alias_actual = conn.execute(
+                "SELECT * FROM actuals WHERE fa_flight_id=?", (alias_id,)
+            ).fetchone()
+            if _actual_rows_conflict(canonical_actual, alias_actual):
+                conflicts += 1
+                continue
+
+            # Merge the most recently observed non-null flight attributes into
+            # the canonical row while preserving its first_seen timestamp.
+            merge_columns = (
+                "ident_iata", "op_carrier", "flight_number", "tail_num", "origin", "dest",
+                "inbound_fa_flight_id", "fl_date", "crs_dep_min", "scheduled_out_utc",
+                "scheduled_off_utc", "scheduled_on_utc", "scheduled_in_utc",
+                "crs_elapsed_min", "distance", "aircraft_type", "cancelled", "diverted",
+                "estimated_out_utc", "estimated_in_utc",
+            )
+            assignments = ", ".join(
+                f"{column}=COALESCE(?, {column})" for column in merge_columns
+            )
+            conn.execute(
+                f"UPDATE flights SET stable_id=?, {assignments}, last_updated_utc=? "
+                "WHERE fa_flight_id=?",
+                (
+                    canonical_id,
+                    *(alias[column] for column in merge_columns),
+                    _now_iso(), canonical_id,
+                ),
+            )
+
+            if alias_actual is not None:
+                upsert_actuals(conn, [{
+                    "fa_flight_id": canonical_id,
+                    "stable_id": canonical_id,
+                    "source_provider": alias_actual["source_provider"],
+                    "actual_out_utc": alias_actual["actual_out_utc"],
+                    "actual_off_utc": alias_actual["actual_off_utc"],
+                    "actual_on_utc": alias_actual["actual_on_utc"],
+                    "actual_in_utc": alias_actual["actual_in_utc"],
+                    "arr_delay_min": alias_actual["arr_delay_min"],
+                    "departure_delay_min": alias_actual["departure_delay_min"],
+                    "cancelled": alias_actual["cancelled"],
+                    "diverted": alias_actual["diverted"],
+                }])
+
+            if has_shap:
+                conn.execute(
+                    "UPDATE OR IGNORE prediction_shap SET fa_flight_id=? "
+                    "WHERE fa_flight_id=?",
+                    (canonical_id, alias_id),
+                )
+                conn.execute(
+                    "DELETE FROM prediction_shap WHERE fa_flight_id=?", (alias_id,)
+                )
+            if has_predictions:
+                if "stable_id" in prediction_columns:
+                    conn.execute(
+                        "UPDATE OR IGNORE predictions SET fa_flight_id=?, stable_id=? "
+                        "WHERE fa_flight_id=?",
+                        (canonical_id, canonical_id, alias_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE OR IGNORE predictions SET fa_flight_id=? "
+                        "WHERE fa_flight_id=?",
+                        (canonical_id, alias_id),
+                    )
+                conn.execute("DELETE FROM predictions WHERE fa_flight_id=?", (alias_id,))
+
+            conn.execute(
+                "UPDATE flights SET inbound_fa_flight_id=? WHERE inbound_fa_flight_id=?",
+                (canonical_id, alias_id),
+            )
+            conn.execute(
+                """INSERT INTO flight_id_aliases
+                   (alias_fa_flight_id, canonical_fa_flight_id, source_provider,
+                    scheduled_out_utc, reconciled_at_utc)
+                   VALUES (?, ?, 'fr24', ?, ?)
+                   ON CONFLICT(alias_fa_flight_id) DO UPDATE SET
+                     canonical_fa_flight_id=excluded.canonical_fa_flight_id,
+                     scheduled_out_utc=excluded.scheduled_out_utc,
+                     reconciled_at_utc=excluded.reconciled_at_utc""",
+                (alias_id, canonical_id, alias["scheduled_out_utc"], _now_iso()),
+            )
+            conn.execute("DELETE FROM actuals WHERE fa_flight_id=?", (alias_id,))
+            conn.execute("DELETE FROM flights WHERE fa_flight_id=?", (alias_id,))
+            reconciled += 1
+
+    conn.commit()
+    return {"reconciled": reconciled, "conflicts": conflicts}
 
 
 def upsert_aircraft_positions(

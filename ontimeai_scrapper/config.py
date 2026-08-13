@@ -39,6 +39,15 @@ LINEAGE_MAX_CONSECUTIVE_FAILURES: int = int(os.getenv("LINEAGE_MAX_CONSECUTIVE_F
 LINEAGE_HYDRATION_BUDGET: int = int(os.getenv("LINEAGE_HYDRATION_BUDGET", "30"))
 LINEAGE_ENABLED: bool = os.getenv("LINEAGE_ENABLED", "true").lower() in ("1", "true", "yes")
 
+# Flights that have predictions but still lack a completed outcome need a tighter
+# refresh loop than the general tail-lineage cache.  This is especially important
+# for long-haul departures: by the time they land they have fallen outside the
+# backend's rolling AeroAPI departure window, and FR24 may assign a new id when it
+# closes the flight.
+PENDING_OUTCOME_GRACE_MINUTES: int = int(os.getenv("PENDING_OUTCOME_GRACE_MINUTES", "30"))
+PENDING_OUTCOME_REFRESH_MINUTES: int = int(os.getenv("PENDING_OUTCOME_REFRESH_MINUTES", "60"))
+PENDING_OUTCOME_LOOKBACK_HOURS: int = int(os.getenv("PENDING_OUTCOME_LOOKBACK_HOURS", "36"))
+
 USER_AGENTS: tuple[str, ...] = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
