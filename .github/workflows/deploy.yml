@@ -1,0 +1,104 @@
+name: Deploy
+
+# Un merge a main despliega el harvester y el job de backfill.
+#
+# Antes esto se corría a mano con deploy.sh y se notaba: las imágenes de los dos
+# jobs quedaron del 19 de agosto, casi un mes sin actualizarse, mientras main
+# seguía avanzando. Nada avisaba.
+on:
+  push:
+    branches: [main]
+  # Permite redesplegar sin tener que empujar un commit vacío.
+  workflow_dispatch:
+
+# Dos despliegues pisándose dejan Cloud Run en un estado indeterminado, así que
+# el segundo espera en vez de cancelar al primero.
+concurrency:
+  group: deploy-harvester
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ontimeai-prod
+  REGION: us-central1
+  IMAGE: gcr.io/ontimeai-prod/ontimeai-harvester
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ontimeai-prod
+          workload_identity_provider: projects/871707213932/locations/global/workloadIdentityPools/github/providers/github
+          service_account: github-deployer@ontimeai-prod.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Construir imagen
+        # Se lanza en modo asincrono y se consulta el estado en vez de dejar que
+        # gcloud espere: al esperar intenta leer el bucket de logs, lo que exige
+        # rol Viewer sobre el proyecto. Sin ese rol sale con codigo 1 aunque el
+        # build haya terminado en SUCCESS.
+        run: |
+          BUILD_ID=$(gcloud builds submit \
+            --config cloudbuild-harvester.yaml \
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
+
+      - name: Desplegar el harvester
+        # La configuracion replica la que corre hoy en produccion, no la de
+        # deploy.sh: ese script quedo apuntando al proyecto viejo `ontimeai`, al
+        # bucket `ontimeai-live-db` y a un cron distinto del real.
+        run: |
+          gcloud run jobs deploy ontimeai-harvester \
+            --image "$IMAGE" \
+            --region "$REGION" \
+            --cpu 1 --memory 1Gi \
+            --max-retries 1 --task-timeout 900 \
+            --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Actualizar la imagen del backfill
+        # Solo se actualiza la imagen, a proposito. Este job no tiene scheduler
+        # (se corre a mano) y lleva argumentos fijados en su ultima ejecucion
+        # manual: `--tail N828NW`. Un `jobs deploy` completo los borraria; con
+        # `update --image` se conservan.
+        run: |
+          gcloud run jobs update ontimeai-outcome-backfill \
+            --image "$IMAGE" \
+            --region "$REGION" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Resumen
+        run: |
+          echo "### Desplegado" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${GITHUB_SHA::7}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          for JOB in ontimeai-harvester ontimeai-outcome-backfill; do
+            IMG=$(gcloud run jobs describe "$JOB" --region "$REGION" \
+                    --project "$PROJECT_ID" \
+                    --format='value(spec.template.spec.template.spec.containers[0].image)')
+            echo "- \`$JOB\` → \`$IMG\`" >> "$GITHUB_STEP_SUMMARY"
+          done
