@@ -90,6 +90,37 @@ jobs:
             --region "$REGION" \
             --project="$PROJECT_ID" --quiet
 
+      - name: Asegurar el scheduler del harvester
+        # Cron 23,38 y no */10.
+        #
+        # Los predictores ocupan :00-:13, :15-:23, :30-:38 y :45-:00 (medido).
+        # Con */10 el harvester arrancaba dentro de esas ventanas cuatro veces
+        # por hora, y live-pull terminaba con conflicto CAS en el 94% de sus
+        # corridas — 45 de 48 por dia. Cada conflicto le hace rehacer el
+        # pipeline entero, lo que alarga el ciclo y genera mas solapamiento.
+        #
+        # :23 y :38 son las dos ventanas libres de 7 minutos; el harvester tarda
+        # ~6. Antes de #14 este scheduler estaba en :08/:38, tambien dos veces
+        # por hora: */10 fue un cambio posterior.
+        #
+        # Si los ciclos se acortan al desaparecer los conflictos, se abren mas
+        # huecos y se puede volver a subir la frecuencia.
+        run: |
+          SA="871707213932-compute@developer.gserviceaccount.com"
+          URI="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/ontimeai-harvester:run"
+          if gcloud scheduler jobs describe ontimeai-harvester-scheduler \
+               --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            ACTION=update
+          else
+            ACTION=create
+          fi
+          gcloud scheduler jobs $ACTION http ontimeai-harvester-scheduler \
+            --location="$REGION" \
+            --schedule="23,38 * * * *" \
+            --uri="$URI" --http-method=POST \
+            --oauth-service-account-email="$SA" \
+            --project="$PROJECT_ID" --quiet
+
       - name: Resumen
         run: |
           echo "### Desplegado" >> "$GITHUB_STEP_SUMMARY"
