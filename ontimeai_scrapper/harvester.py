@@ -293,6 +293,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run_once(args: argparse.Namespace) -> int:
+    _t_chain: float | None = None
     base_generation: int | None = None
     if args.local_db:
         local_path = Path(args.local_db)
@@ -389,6 +390,7 @@ def _run_once(args: argparse.Namespace) -> int:
                 len(stats.unique_tails), len(expanded),
                 len(expanded) - len(stats.unique_tails),
             )
+            _t_chain = time.monotonic()
             chain_stats = harvest_chain_walk(
                 conn,
                 client,
@@ -413,11 +415,15 @@ def _run_once(args: argparse.Namespace) -> int:
         # real-id rows once Capa 1 sees the flight, and TTL-purge stale ones. Runs every
         # tick regardless of CAPTURE_FUTURE_LEGS so leftover placeholders are always
         # cleaned up even after the flag is turned off.
+        if _t_chain is not None:
+            log.info("fase chain walk: %.1f s", time.monotonic() - _t_chain)
+
         if not args.dry_run:
+            _t_recon = time.monotonic()
             recon = db.reconcile_synthetic_flights(conn)
-            if recon["reconciled"] or recon["purged"]:
-                log.info("reconcile_synthetic: reconciled=%d purged=%d",
-                         recon["reconciled"], recon["purged"])
+            log.info("fase reconcile: %.1f s (reconciled=%d purged=%d)",
+                     time.monotonic() - _t_recon,
+                     recon["reconciled"], recon["purged"])
             alias_recon = db.reconcile_fr24_flight_aliases(conn)
             if alias_recon["reconciled"] or alias_recon["conflicts"]:
                 log.info("reconcile_fr24_aliases: reconciled=%d conflicts=%d",
