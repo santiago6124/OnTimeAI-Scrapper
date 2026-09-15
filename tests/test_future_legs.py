@@ -100,11 +100,18 @@ def test_is_future_atl_leg():
 def conn():
     tf = tempfile.mktemp(suffix=".db")
     with db.open_db(tf) as c:
-        # predictions is backend-owned; create a minimal one for the repoint test.
+        # predictions y prediction_shap son del backend; se crean minimas para
+        # los tests que verifican que la reconciliacion las arrastre.
         c.execute(
             """CREATE TABLE IF NOT EXISTS predictions(
                  fa_flight_id TEXT, predicted_at_utc TEXT, proba_delay REAL,
                  PRIMARY KEY(fa_flight_id, predicted_at_utc))"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS prediction_shap(
+                 fa_flight_id TEXT, predicted_at_utc TEXT, feature_name TEXT,
+                 shap_value REAL, feature_value TEXT, rank INTEGER,
+                 PRIMARY KEY(fa_flight_id, predicted_at_utc, feature_name))"""
         )
         yield c
     os.remove(tf)
@@ -169,12 +176,6 @@ def test_reconcile_keeps_unmatched_future_syn(conn):
 
 
 def test_reconcile_fr24_changed_id_keeps_predicted_id_and_moves_actual(conn):
-    conn.execute(
-        """CREATE TABLE prediction_shap(
-             fa_flight_id TEXT, predicted_at_utc TEXT, feature_name TEXT,
-             shap_value REAL, feature_value TEXT, rank INTEGER,
-             PRIMARY KEY(fa_flight_id, predicted_at_utc, feature_name))"""
-    )
     scheduled = (datetime.now(timezone.utc) - timedelta(hours=14)).replace(
         second=0, microsecond=0
     ).isoformat()
@@ -273,3 +274,139 @@ def test_reconcile_fr24_alias_refuses_conflicting_labels(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM flights WHERE fa_flight_id IN (?,?)", (first_id, second_id)
     ).fetchone()[0] == 2
+
+
+# -- huerfanos: lo que quedaba colgando de un placeholder ----------------------
+#
+# `reconcile_synthetic_flights` tiene dos caminos y solo uno limpiaba bien.
+#
+# El paso 1 —el SYN encontro su vuelo real— repuntaba `predictions` y `actuals`
+# y despues borraba el placeholder, pero se olvidaba de `prediction_shap`. El
+# SHAP quedaba apuntando al id muerto mientras su prediccion se mudaba, y
+# `GET /flights/{id}` devolvia explicacion vacia: el issue #5 del backend.
+#
+# El paso 2 —purga por TTL, el SYN nunca aparecio— borraba la fila de `flights`
+# y dejaba todo lo demas colgando. Esas predicciones no pueden recibir label
+# nunca, porque el vuelo real no existio: el issue #10.
+#
+# Medido en produccion antes del arreglo:
+#   33.469 predicciones huerfanas   (16,1% de la tabla, 100% con id SYN-)
+#   768.360 filas de SHAP con id SYN-  (95,4%)
+#   98% de las predicciones con vuelo real sin ninguna fila de SHAP
+
+
+def _shap(c, fid, at, *, feature="DEP_HOUR", value=0.3):
+    c.execute(
+        "INSERT INTO prediction_shap VALUES (?,?,?,?,?,?)",
+        (fid, at, feature, value, "12", 1),
+    )
+
+
+class TestReconciliacionArrastraElShap:
+    def test_el_shap_sigue_a_su_prediccion(self, conn):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        syn, real = f"SYN-DL456-ATL-JFK-{today}", "3ffreal1"
+        at = "2026-06-01T01:00:00+00:00"
+        _insert_flight(conn, syn, carrier="DL", number="456", origin="ATL", dest="JFK", fl_date=today, sched_out=future)
+        _insert_flight(conn, real, carrier="DL", number="456", origin="ATL", dest="JFK", fl_date=today, sched_out=future)
+        conn.execute("INSERT INTO predictions VALUES (?,?,?)", (syn, at, 0.4))
+        _shap(conn, syn, at)
+        conn.commit()
+
+        assert db.reconcile_synthetic_flights(conn)["reconciled"] == 1
+
+        pred = conn.execute("SELECT fa_flight_id FROM predictions").fetchall()
+        shap = conn.execute("SELECT fa_flight_id FROM prediction_shap").fetchall()
+        assert [r[0] for r in pred] == [real]
+        assert [r[0] for r in shap] == [real], (
+            "el SHAP se quedo en el id muerto: /flights/{id} devolveria vacio"
+        )
+
+    def test_no_queda_shap_apuntando_al_placeholder(self, conn):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        syn, real = f"SYN-DL456-ATL-JFK-{today}", "3ffreal1"
+        _insert_flight(conn, syn, carrier="DL", number="456", origin="ATL", dest="JFK", fl_date=today, sched_out=future)
+        _insert_flight(conn, real, carrier="DL", number="456", origin="ATL", dest="JFK", fl_date=today, sched_out=future)
+        # El id real ya tiene SHAP en la misma clave: el UPDATE OR IGNORE lo
+        # respeta y el duplicado del placeholder se borra.
+        _shap(conn, syn, "2026-06-01T01:00:00+00:00")
+        _shap(conn, real, "2026-06-01T01:00:00+00:00", value=0.9)
+        conn.commit()
+
+        db.reconcile_synthetic_flights(conn)
+        filas = conn.execute(
+            "SELECT fa_flight_id, shap_value FROM prediction_shap"
+        ).fetchall()
+        assert len(filas) == 1
+        assert filas[0][0] == real
+        assert filas[0][1] == pytest.approx(0.9), "gano el del id real, no el duplicado"
+
+
+class TestPurgaPorTtlNoDejaHuerfanos:
+    def test_borra_las_predicciones_del_placeholder(self, conn):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stale = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        syn = f"SYN-DL999-ATL-JFK-{today}"
+        at = "2026-06-01T01:00:00+00:00"
+        _insert_flight(conn, syn, carrier="DL", number="999", origin="ATL", dest="JFK", fl_date=today, sched_out=stale)
+        conn.execute("INSERT INTO predictions VALUES (?,?,?)", (syn, at, 0.4))
+        _shap(conn, syn, at)
+        conn.execute(
+            "INSERT INTO actuals (fa_flight_id, settled_at_utc) VALUES (?,?)", (syn, at)
+        )
+        conn.commit()
+
+        assert db.reconcile_synthetic_flights(conn, ttl_hours=3)["purged"] == 1
+
+        for tabla in ("flights", "predictions", "prediction_shap", "actuals"):
+            n = conn.execute(
+                f"SELECT COUNT(*) FROM {tabla} WHERE fa_flight_id=?", (syn,)
+            ).fetchone()[0]
+            assert n == 0, f"quedaron {n} filas huerfanas en {tabla}"
+
+    def test_no_toca_lo_que_no_es_del_placeholder(self, conn):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stale = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        syn = f"SYN-DL999-ATL-JFK-{today}"
+        otro = "3ffreal9"
+        at = "2026-06-01T01:00:00+00:00"
+        _insert_flight(conn, syn, carrier="DL", number="999", origin="ATL", dest="JFK", fl_date=today, sched_out=stale)
+        _insert_flight(conn, otro, carrier="AA", number="111", origin="ATL", dest="MIA", fl_date=today, sched_out=future)
+        conn.execute("INSERT INTO predictions VALUES (?,?,?)", (syn, at, 0.4))
+        conn.execute("INSERT INTO predictions VALUES (?,?,?)", (otro, at, 0.2))
+        _shap(conn, syn, at)
+        _shap(conn, otro, at)
+        conn.commit()
+
+        db.reconcile_synthetic_flights(conn, ttl_hours=3)
+
+        assert [r[0] for r in conn.execute("SELECT fa_flight_id FROM predictions")] == [otro]
+        assert [r[0] for r in conn.execute("SELECT fa_flight_id FROM prediction_shap")] == [otro]
+
+    def test_un_placeholder_todavia_vigente_conserva_todo(self, conn):
+        """Solo se purga pasado el TTL; antes el vuelo todavia puede aparecer."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        syn = f"SYN-DL777-ATL-JFK-{today}"
+        at = "2026-06-01T01:00:00+00:00"
+        _insert_flight(conn, syn, carrier="DL", number="777", origin="ATL", dest="JFK", fl_date=today, sched_out=future)
+        conn.execute("INSERT INTO predictions VALUES (?,?,?)", (syn, at, 0.4))
+        conn.commit()
+
+        res = db.reconcile_synthetic_flights(conn, ttl_hours=3)
+        assert res == {"reconciled": 0, "purged": 0}
+        assert conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] == 1
+
+    def test_sigue_siendo_idempotente(self, conn):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stale = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        syn = f"SYN-DL999-ATL-JFK-{today}"
+        _insert_flight(conn, syn, carrier="DL", number="999", origin="ATL", dest="JFK", fl_date=today, sched_out=stale)
+        conn.execute("INSERT INTO predictions VALUES (?,?,?)", (syn, "2026-06-01T01:00:00+00:00", 0.4))
+        conn.commit()
+
+        assert db.reconcile_synthetic_flights(conn, ttl_hours=3)["purged"] == 1
+        assert db.reconcile_synthetic_flights(conn, ttl_hours=3)["purged"] == 0

@@ -408,9 +408,8 @@ def reconcile_synthetic_flights(
 
     Idempotent. Safe to run every tick. Returns ``{"reconciled": n, "purged": n}``.
     """
-    has_predictions = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='predictions'"
-    ).fetchone() is not None
+    has_predictions = _table_exists(conn, "predictions")
+    has_shap = _table_exists(conn, "prediction_shap")
 
     # 1. Find (syn_id -> real_id) pairs sharing flight identity. Restrict to recent
     #    fl_date so the self-join stays cheap (placeholders are always near-future).
@@ -445,6 +444,18 @@ def reconcile_synthetic_flights(
                 (real_id, syn_id),
             )
             conn.execute("DELETE FROM predictions WHERE fa_flight_id=?", (syn_id,))
+        if has_shap:
+            # Sin esto el SHAP se queda apuntando al placeholder mientras su
+            # prediccion se muda al id real, y `GET /flights/{id}` devuelve
+            # explicacion vacia. Medido antes del arreglo: el 95,4% de
+            # `prediction_shap` tenia un id SYN-, y el 98% de las predicciones
+            # con vuelo real no tenian SHAP. Es el issue #5 del backend, y la
+            # funcion de alias de al lado ya hacia esto bien.
+            conn.execute(
+                "UPDATE OR IGNORE prediction_shap SET fa_flight_id=? WHERE fa_flight_id=?",
+                (real_id, syn_id),
+            )
+            conn.execute("DELETE FROM prediction_shap WHERE fa_flight_id=?", (syn_id,))
         conn.execute(
             "UPDATE OR IGNORE actuals SET fa_flight_id=? WHERE fa_flight_id=?",
             (real_id, syn_id),
@@ -454,15 +465,34 @@ def reconcile_synthetic_flights(
         reconciled += 1
 
     # 2. TTL purge: stale placeholders that never matched a real id.
-    cur = conn.execute(
-        f"""
-        DELETE FROM flights
-        WHERE fa_flight_id LIKE 'SYN-%'
-          AND scheduled_out_utc IS NOT NULL
-          AND datetime(scheduled_out_utc) < datetime('now', '-{int(ttl_hours)} hours')
-        """
-    )
-    purged = cur.rowcount or 0
+    #
+    # Se borra tambien lo que colgaba de ellos. Antes solo se borraba la fila de
+    # `flights`, y sus predicciones quedaban apuntando a un id que ya no existia:
+    # inevaluables para siempre, porque el vuelo real nunca aparecio. Medido
+    # antes del arreglo: 33.469 predicciones huerfanas, el 16,1% de la tabla, el
+    # 100% con id SYN-, y ninguna con label. Es el issue #10 del backend.
+    #
+    # Se resuelven los ids primero en vez de usar RETURNING, que exige SQLite
+    # 3.35 y no esta garantizado en la imagen.
+    stale_ids = [
+        r[0]
+        for r in conn.execute(
+            f"""
+            SELECT fa_flight_id FROM flights
+            WHERE fa_flight_id LIKE 'SYN-%'
+              AND scheduled_out_utc IS NOT NULL
+              AND datetime(scheduled_out_utc) < datetime('now', '-{int(ttl_hours)} hours')
+            """
+        ).fetchall()
+    ]
+    for syn_id in stale_ids:
+        if has_predictions:
+            conn.execute("DELETE FROM predictions WHERE fa_flight_id=?", (syn_id,))
+        if has_shap:
+            conn.execute("DELETE FROM prediction_shap WHERE fa_flight_id=?", (syn_id,))
+        conn.execute("DELETE FROM actuals WHERE fa_flight_id=?", (syn_id,))
+        conn.execute("DELETE FROM flights WHERE fa_flight_id=?", (syn_id,))
+    purged = len(stale_ids)
     conn.commit()
     return {"reconciled": reconciled, "purged": purged}
 
