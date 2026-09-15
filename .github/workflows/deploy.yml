@@ -91,20 +91,28 @@ jobs:
             --project="$PROJECT_ID" --quiet
 
       - name: Asegurar el scheduler del harvester
-        # Cron 23,38 y no */10.
+        # Cron 8,23,38,53 — cuatro corridas por hora, en los huecos.
         #
-        # Los predictores ocupan :00-:13, :15-:23, :30-:38 y :45-:00 (medido).
-        # Con */10 el harvester arrancaba dentro de esas ventanas cuatro veces
-        # por hora, y live-pull terminaba con conflicto CAS en el 94% de sus
-        # corridas — 45 de 48 por dia. Cada conflicto le hace rehacer el
-        # pipeline entero, lo que alarga el ciclo y genera mas solapamiento.
+        # El ciclo entero se realimentaba: con */10 el harvester pisaba las
+        # ventanas de los predictores, live-pull salia con conflicto CAS en el
+        # 94% de sus corridas, y cada conflicto le hace rehacer el pipeline
+        # entero. Ciclos mas largos, mas solapamiento, mas conflictos.
         #
-        # :23 y :38 son las dos ventanas libres de 7 minutos; el harvester tarda
-        # ~6. Antes de #14 este scheduler estaba en :08/:38, tambien dos veces
-        # por hora: */10 fue un cambio posterior.
+        # Bajar a dos corridas (:23 y :38) lo corto. Medido despues del cambio:
+        # los ciclos de live-pull pasaron de 10,2 a 4,8-6,9 min, cero conflictos
+        # CAS en dos horas, y la cobertura de lineage quedo igual (2,1-3,1% de
+        # NaN contra 1,1-2,7% de linea base).
         #
-        # Si los ciclos se acortan al desaparecer los conflictos, se abren mas
-        # huecos y se puede volver a subir la frecuencia.
+        # Con los predictores en ~7 min los huecos son de 8, no de 4, y entran
+        # cuatro corridas en vez de dos. El harvester tarda 5,0-6,8 min:
+        #
+        #   live-pull     :00-:07   :30-:37
+        #   live-pull-2   :15-:22   :45-:52
+        #   harvester     :08-:15   :23-:30   :38-:45   :53-:00
+        #
+        # Para pasar de cuatro hay que acortar el harvester, no mover el cron.
+        # Medido por fase: chain walk ~53 s y reconcile 49-63 s, este ultimo
+        # escalando con la cantidad de pares a reconciliar (17-62).
         run: |
           SA="871707213932-compute@developer.gserviceaccount.com"
           URI="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/ontimeai-harvester:run"
@@ -116,7 +124,7 @@ jobs:
           fi
           gcloud scheduler jobs $ACTION http ontimeai-harvester-scheduler \
             --location="$REGION" \
-            --schedule="23,38 * * * *" \
+            --schedule="8,23,38,53 * * * *" \
             --uri="$URI" --http-method=POST \
             --oauth-service-account-email="$SA" \
             --project="$PROJECT_ID" --quiet
