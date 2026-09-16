@@ -43,6 +43,11 @@ if $do_build; then
         .
 fi
 
+# El camino real de despliegue es .github/workflows/deploy.yml, que corre en
+# cada push a main. Este script es para desplegar a mano, y por eso actualiza
+# con `--update-env-vars` en vez de `--set-env-vars`: correrlo desactualizado no
+# puede apagar una variable que alguien haya agregado despues. La lista de abajo
+# igual tiene que espejar la del workflow.
 if $do_job; then
     echo ">> Deploy Cloud Run Job: $JOB_NAME"
     if gcloud run jobs describe "$JOB_NAME" --region="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
@@ -50,15 +55,15 @@ if $do_job; then
             --project="$PROJECT_ID" --region="$REGION" \
             --image="$IMAGE" \
             --service-account="$SERVICE_ACCOUNT" \
-            --set-env-vars=GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=70 \
-            --memory=1Gi --cpu=1 --task-timeout=300s --max-retries=1
+            --update-env-vars=GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=70 \
+            --memory=1Gi --cpu=1 --task-timeout=900s --max-retries=1
     else
         gcloud run jobs create "$JOB_NAME" \
             --project="$PROJECT_ID" --region="$REGION" \
             --image="$IMAGE" \
             --service-account="$SERVICE_ACCOUNT" \
             --set-env-vars=GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=70 \
-            --memory=1Gi --cpu=1 --task-timeout=300s --max-retries=1
+            --memory=1Gi --cpu=1 --task-timeout=900s --max-retries=1
     fi
 fi
 
