@@ -50,14 +50,14 @@ if $do_job; then
             --project="$PROJECT_ID" --region="$REGION" \
             --image="$IMAGE" \
             --service-account="$SERVICE_ACCOUNT" \
-            --set-env-vars=GCS_BUCKET=ontimeai-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO \
+            --set-env-vars=GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=70 \
             --memory=1Gi --cpu=1 --task-timeout=300s --max-retries=1
     else
         gcloud run jobs create "$JOB_NAME" \
             --project="$PROJECT_ID" --region="$REGION" \
             --image="$IMAGE" \
             --service-account="$SERVICE_ACCOUNT" \
-            --set-env-vars=GCS_BUCKET=ontimeai-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO \
+            --set-env-vars=GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=70 \
             --memory=1Gi --cpu=1 --task-timeout=300s --max-retries=1
     fi
 fi
