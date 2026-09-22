@@ -294,6 +294,45 @@ def populate_inbound_chain(conn: sqlite3.Connection, tail: str, *, overwrite: bo
     return n_updated
 
 
+def salidas_sin_predecir_tail_order(
+    conn: sqlite3.Connection,
+    *,
+    horizonte_horas: int = 8,
+) -> list[str]:
+    """Matriculas con una salida del anchor proxima que todavia no se predijo.
+
+    Es el hueco medido: de 2.210 salidas de ATL sin prediccion entre el 17 y el
+    20/09, 2.209 las operaba un avion que ya teniamos en la base. No eran
+    inalcanzables; nunca les consultamos el itinerario a tiempo.
+
+    Ordenadas por salida mas inminente primero. El resto de las categorias se
+    recorren con `sorted(candidate_tails)`, o sea alfabeticamente, y con eso un
+    avion que sale en media hora compite contra uno que sale maniana y decide
+    el abecedario.
+    """
+    try:
+        filas = conn.execute(
+            """
+            SELECT f.tail_num, MIN(f.scheduled_out_utc) AS sale
+              FROM flights f
+             WHERE f.tail_num IS NOT NULL AND f.tail_num <> ''
+               AND f.origin IN ('ATL', 'KATL')
+               AND COALESCE(f.cancelled, 0) = 0
+               AND f.scheduled_out_utc > strftime('%Y-%m-%dT%H:%M:%S', 'now')
+               AND f.scheduled_out_utc < strftime(
+                     '%Y-%m-%dT%H:%M:%S', 'now', ?)
+               AND NOT EXISTS (SELECT 1 FROM predictions p
+                                WHERE p.fa_flight_id = f.fa_flight_id)
+             GROUP BY f.tail_num
+             ORDER BY sale
+            """,
+            (f"+{int(horizonte_horas)} hours",),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - base incompleta en bootstrap
+        return []
+    return [r[0].strip().upper() for r in filas if r[0]]
+
+
 def select_tails_to_hydrate(
     conn: sqlite3.Connection,
     candidate_tails: set[str],
@@ -305,14 +344,21 @@ def select_tails_to_hydrate(
 
     Priority order (highest -> lowest):
       1. bootstrap_pending - backend explicitly requested via placeholder rows
-      2. predicted_today   - in flights with a prediction scheduled today
+      2. sin_predecir      - salida del anchor proxima y todavia sin prediccion
+      3. predicted_today   - in flights with a prediction scheduled today
       3. high_freq         - >= 5 legs today (adaptive TTL 2h)
       4. never             - never-hydrated tails (cache miss)
       5. expired           - stale cache (TTL elapsed)
 
-    The first two classes are "lineage-critical": they directly affect today's
+    The first classes are "lineage-critical": they directly affect today's
     predictions. They jump ahead of the general high_freq queue so the limited
     per-tick budget always lands on tails the model is about to score.
+
+    `sin_predecir` va antes que `predicted_today` a proposito. Sin ella el
+    presupuesto se gastaba reforzando los aviones que YA estabamos prediciendo
+    —un circulo que mantenia cubierto lo cubierto y dejaba el hueco intacto—.
+    Subir el presupuesto de 30 a 70 no movio la cobertura por esto: los 40
+    lugares nuevos fueron a mas de lo mismo.
     """
     if not candidate_tails:
         return []
@@ -347,10 +393,13 @@ def select_tails_to_hydrate(
 
     pending_outcome_order = pending_outcome_tail_order(conn)
     pending_outcomes = set(pending_outcome_order)
+    sin_predecir_order = salidas_sin_predecir_tail_order(conn)
+    sin_predecir_set = set(sin_predecir_order)
 
     now = _now()
     bootstrap_pending: list[str] = []
     pending_outcome_list: list[str] = []
+    sin_predecir_list: list[str] = []
     predicted_today_list: list[str] = []
     high_freq: list[str] = []
     never: list[str] = []
@@ -388,7 +437,27 @@ def select_tails_to_hydrate(
                 pending_outcome_list.append(t)
             continue
 
-        # Predicted-today = second highest. We're going to score this tail
+        # Salida proxima y sin predecir: es el hueco. Va antes que
+        # predicted_today porque ese avion todavia no tiene prediccion y este
+        # es el unico momento en que se puede conseguir.
+        if t in sin_predecir_set:
+            if crow is None:
+                sin_predecir_list.append(t)
+                continue
+            try:
+                hu = datetime.fromisoformat(crow["hydrated_until"])
+                if hu.tzinfo is None:
+                    hu = hu.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                sin_predecir_list.append(t)
+                continue
+            if (hu < threshold
+                    and (crow["consecutive_failures"] or 0)
+                    < config.LINEAGE_MAX_CONSECUTIVE_FAILURES):
+                sin_predecir_list.append(t)
+            continue
+
+        # Predicted-today. We're going to score this tail
         # in the next backend tick and we want lineage data to drive that.
         if t in predicted_today:
             if crow is None:
@@ -425,9 +494,13 @@ def select_tails_to_hydrate(
 
     pending_rank = {tail: index for index, tail in enumerate(pending_outcome_order)}
     pending_outcome_list.sort(key=lambda tail: pending_rank.get(tail, len(pending_rank)))
+    # Dentro de `sin_predecir`, la salida mas inminente primero: si el
+    # presupuesto no alcanza para todas, que se gaste en las que estan por irse.
+    rank_sp = {tail: i for i, tail in enumerate(sin_predecir_order)}
+    sin_predecir_list.sort(key=lambda tail: rank_sp.get(tail, len(rank_sp)))
     ordered = (
-        bootstrap_pending + pending_outcome_list + predicted_today_list
-        + high_freq + never + expired
+        bootstrap_pending + pending_outcome_list + sin_predecir_list
+        + predicted_today_list + high_freq + never + expired
     )
     return ordered[:budget]
 
