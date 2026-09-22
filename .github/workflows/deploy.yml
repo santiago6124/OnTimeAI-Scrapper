@@ -76,7 +76,7 @@ jobs:
             --region "$REGION" \
             --cpu 1 --memory 1Gi \
             --max-retries 1 --task-timeout 900 \
-            --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=70" \
+            --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,AIRPORT_CODE=KATL,LOG_LEVEL=INFO,FR24_MAX_PAGES=30,CAPTURE_FUTURE_LEGS=true,FUTURE_LEG_HORIZON_HOURS=6,LINEAGE_HYDRATION_BUDGET=30" \
             --project="$PROJECT_ID" --quiet
 
       - name: Actualizar la imagen del backfill
