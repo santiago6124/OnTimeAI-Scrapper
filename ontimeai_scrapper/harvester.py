@@ -326,6 +326,35 @@ def _run_once(args: argparse.Namespace) -> int:
             client=client,
         )
         stats.n_tails_hydrated = len(stats.unique_tails)
+
+        # Capa 1B: el horario por delante. La capa 1 trae el tablero en vivo,
+        # que llega ~1 h adelante; esto pide el mismo endpoint con una marca de
+        # tiempo futura y trae lo que sale dentro de varias horas. Es de donde
+        # salia el hueco de cobertura: la mitad de las salidas de ATL se veian
+        # recien despues de despegar.
+        #
+        # Va aparte de `stats` para que un fallo suyo no contamine el reporte
+        # de la capa 1, y se puede apagar con HORARIO_FUTURO=false.
+        if config.HORARIO_FUTURO and not args.dry_run:
+            try:
+                from .fr24_horario import alcance_horas, horario_futuro
+
+                f_rows, a_rows = horario_futuro(
+                    client, codigo=args.airport, horas=config.HORARIO_HORAS,
+                    limite=args.flight_limit,
+                )
+                n_f = db.upsert_flights(conn, f_rows)
+                n_a = db.upsert_actuals(conn, a_rows)
+                alcance = alcance_horas(f_rows)
+                log.info(
+                    "DONE capa1b=horario marcas=%s vuelos=%d upsert=%d actuals=%d "
+                    "alcance=%.1fh",
+                    len(config.HORARIO_HORAS), len(f_rows), n_f, n_a,
+                    alcance if alcance is not None else -1.0,
+                )
+            except Exception as exc:  # noqa: BLE001 - nunca tumbar el ciclo
+                log.warning("capa1b=horario fallo: %s: %s", type(exc).__name__, exc)
+
         if not args.dry_run:
             db.record_harvester_run(
                 conn,

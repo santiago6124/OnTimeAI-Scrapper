@@ -32,6 +32,16 @@ LOCAL_DB_PATH: str = os.getenv("LOCAL_DB_PATH", "/tmp/live_data.db")
 # until the dry-run lead-time histogram validates the horizon gain. See
 # FUTURE_LEG_CAPTURE_DESIGN.md.
 CAPTURE_FUTURE_LEGS: bool = os.getenv("CAPTURE_FUTURE_LEGS", "false").lower() in ("1", "true", "yes")
+
+# Pedir el horario del anchor por adelantado en vez de solo el tablero en
+# vivo. El tablero vivo llega ~1 h adelante; con `plugin-setting[schedule]
+# [timestamp]` el mismo endpoint devuelve el horario de maniana. Ver
+# ontimeai_scrapper/fr24_horario.py.
+HORARIO_FUTURO: bool = os.getenv("HORARIO_FUTURO", "true").lower() in ("1", "true", "yes")
+# Marcas de tiempo a consultar, en horas adelante, separadas por coma.
+HORARIO_HORAS: tuple[float, ...] = tuple(
+    float(x) for x in os.getenv("HORARIO_HORAS", "2,4,6,8,10,12").split(",") if x.strip()
+)
 FUTURE_LEG_HORIZON_HOURS: int = int(os.getenv("FUTURE_LEG_HORIZON_HOURS", "12"))
 
 LINEAGE_FRESHNESS_HOURS: int = int(os.getenv("LINEAGE_FRESHNESS_HOURS", "6"))
