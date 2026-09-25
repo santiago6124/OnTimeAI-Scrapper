@@ -39,6 +39,7 @@ CAPTURE_FUTURE_LEGS: bool = os.getenv("CAPTURE_FUTURE_LEGS", "false").lower() in
 # ontimeai_scrapper/fr24_horario.py.
 HORARIO_FUTURO: bool = os.getenv("HORARIO_FUTURO", "true").lower() in ("1", "true", "yes")
 # Marcas de tiempo a consultar, en horas adelante, separadas por coma.
+HORARIO_PAGINAS: int = int(os.getenv("HORARIO_PAGINAS", "2"))
 HORARIO_HORAS: tuple[float, ...] = tuple(
     float(x) for x in os.getenv("HORARIO_HORAS", "2,4,6,8,10,12").split(",") if x.strip()
 )
