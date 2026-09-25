@@ -129,3 +129,48 @@ class TestAlcance:
         ahora = datetime.now(timezone.utc)
         filas = [{"scheduled_out_utc": (ahora - timedelta(hours=3)).isoformat()}]
         assert fr24_horario.alcance_horas(filas) is None
+
+
+class TestPaginacion:
+    """
+    Con una sola pagina por marca quedaban huecos entre marcas consecutivas.
+
+    Cada pagina trae 100 salidas y cubre ~1,5 h; la siguiente sigue desde donde
+    termino la anterior. Medido contra la API real:
+
+        +4h pagina 1   de +4,0h a +5,6h
+        +4h pagina 2   de +5,6h a +6,8h    100 vuelos distintos
+        +4h pagina 3   de +6,8h a +8,3h    100 vuelos distintos
+
+    La marca de +2h llegaba a +3,6h y la de +4h arrancaba en +4,0h: entre medio
+    no mirabamos nada. Ahi caian los 82 vuelos que seguian sin predecir el
+    24/09, de los cuales 74 eran de Delta —la aerolinea del hub, que obviamente
+    publica su horario—. No era un limite de FR24: no le pediamos todo.
+    """
+
+    def test_pide_mas_de_una_pagina_por_defecto(self) -> None:
+        api = _ApiFalso(_payload([_vuelo(f"x{i}", 4) for i in range(100)]))
+        fr24_horario.horario_futuro(_ClienteFalso(api), codigo="KATL", horas=(4,))
+
+        paginas = [p["params"]["page"] for p in api.pedidos]
+        assert paginas == [1, 2], "una sola pagina deja hueco hasta la marca siguiente"
+
+    def test_deja_de_paginar_si_la_pagina_viene_incompleta(self) -> None:
+        """Menos de `limite` significa que no hay mas: no gastar la llamada."""
+        api = _ApiFalso(_payload([_vuelo("x1", 4)]))
+        fr24_horario.horario_futuro(_ClienteFalso(api), codigo="KATL", horas=(4,))
+        assert len(api.pedidos) == 1
+
+    def test_las_paginas_traen_vuelos_distintos(self) -> None:
+        class _PorPagina(_ApiFalso):
+            def request(self, url, params=None, headers=None, timeout=None):
+                self.pedidos.append({"url": url, "params": dict(params or {})})
+                pag = int((params or {}).get("page", 1))
+                # Cada pagina, vuelos propios: es como responde FR24.
+                return _Respuesta(_payload(
+                    [_vuelo(f"p{pag}-{i}", 4 + pag) for i in range(100)]), 200)
+
+        api = _PorPagina(_payload([]))
+        filas, _ = fr24_horario.horario_futuro(
+            _ClienteFalso(api), codigo="KATL", horas=(4,), paginas_por_marca=2)
+        assert len(filas) == 200, "las dos paginas suman, no se pisan"
