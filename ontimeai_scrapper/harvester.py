@@ -342,6 +342,7 @@ def _run_once(args: argparse.Namespace) -> int:
                 f_rows, a_rows = horario_futuro(
                     client, codigo=args.airport, horas=config.HORARIO_HORAS,
                     limite=args.flight_limit,
+                    paginas_por_marca=config.HORARIO_PAGINAS,
                 )
                 n_f = db.upsert_flights(conn, f_rows)
                 n_a = db.upsert_actuals(conn, a_rows)

@@ -37,10 +37,22 @@ log = logging.getLogger(__name__)
 
 FR24_AIRPORT_URL = f"{Core.api_flightradar_base_url}/airport.json"
 
-# Cada consulta devuelve ~100 salidas que cubren una ventana de una a cuatro
-# horas segun el trafico. Estas marcas cubren el dia sin dejar huecos grandes
-# en el pico de la maniana, que es donde la cobertura se desplomaba al 21%.
+# Cada pagina trae 100 salidas y cubre ~1,5 h; la siguiente sigue avanzando en
+# el tiempo desde donde termino la anterior:
+#
+#     +4h pagina 1   de +4,0h a +5,6h
+#     +4h pagina 2   de +5,6h a +6,8h    (100 vuelos distintos)
+#     +4h pagina 3   de +6,8h a +8,3h    (100 vuelos distintos)
+#
+# Con una sola pagina por marca quedaban huecos entre marcas consecutivas: la
+# de +2h llegaba a +3,6h y la de +4h arrancaba en +4,0h. Ahi caian los vuelos
+# que seguian sin predecir —74 de 82 eran de Delta, la aerolinea del hub, que
+# obviamente publica su horario—. No era un limite de FR24: no le pediamos todo.
 HORAS_ADELANTE_DEFECTO = (2, 4, 6, 8, 10, 12)
+
+# Dos paginas por marca: cada una cubre ~3 h y las marcas van cada 2 h, asi que
+# se solapan en vez de dejar hueco. Son 12 llamadas por ciclo en vez de 6.
+PAGINAS_POR_MARCA_DEFECTO = 2
 
 
 def _params(codigo: str, limite: int, pagina: int, cuando: int | None) -> dict[str, Any]:
@@ -102,7 +114,7 @@ def horario_futuro(
     codigo: str = config.AIRPORT_CODE,
     horas: tuple[float, ...] = HORAS_ADELANTE_DEFECTO,
     limite: int = 100,
-    paginas_por_marca: int = 1,
+    paginas_por_marca: int = PAGINAS_POR_MARCA_DEFECTO,
 ) -> tuple[list[dict], list[dict]]:
     """Filas de `flights` y `actuals` del horario por delante del anchor.
 
