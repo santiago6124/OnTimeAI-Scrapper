@@ -823,6 +823,14 @@ def download_db_snapshot_from_gcs(
         raise GCSGenerationConflict(
             f"la DB cambió durante la descarga de generation={generation}"
         ) from exc
+    except NotFound as exc:
+        # Otro job subió una generación nueva entre reload() y la descarga:
+        # la pedida pasó a soft-deleted y GCS responde 404. Es la misma
+        # carrera que PreconditionFailed; el caller reintenta y resuelve la
+        # generación vigente de nuevo.
+        raise GCSGenerationConflict(
+            f"generation={generation} fue reemplazada antes de descargarla"
+        ) from exc
     log.info("downloaded %d bytes (generation=%d)", local.stat().st_size, generation)
     return local, generation
 
