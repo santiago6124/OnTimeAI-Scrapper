@@ -240,6 +240,47 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
+def _preservar_primer_avistaje(
+    conn: sqlite3.Connection, superviviente: str, perdedora: str
+) -> None:
+    """Lleva a la fila que sobrevive el `first_seen_utc` mas antiguo de las dos.
+
+    Al colapsar dos ids del mismo vuelo se migran predicciones, SHAP y actuals
+    —todo lo que APUNTA al vuelo— y despues se borra la fila perdedora. Pero
+    `first_seen_utc` no apunta a ningun lado: vive en la fila, y es lo unico
+    que solo la perdedora sabe.
+
+    Cuando la perdedora es el placeholder SYN, ese dato es la unica prueba de
+    que supimos del vuelo con horas de anticipacion. Perderlo deja a la
+    superviviente declarando que aparecio ~1 h antes de salir, que es cuando
+    FR24 recien le pone id real. La columna no queda corrupta —dice la verdad
+    sobre SU fila— pero deja de responder lo que todo el mundo le pregunta,
+    que es cuando nos enteramos del vuelo.
+
+    Medido antes del arreglo, sobre salidas de ATL del 24 al 26/09: de 2.703
+    vuelos con prediccion, 2.694 tenian `first_seen_utc` POSTERIOR a su propia
+    primera prediccion. Nadie puede predecir una fila que todavia no existe; lo
+    que pasaba es que la fila que quedaba no era la que se habia predicho.
+
+    Se ordena con `datetime()` y no comparando texto: los escritores guardan
+    formatos distintos —con `T` y con espacio, con y sin offset, con y sin
+    microsegundos— y como texto la `T` (0x54) le gana al espacio (0x20), asi
+    que un avistaje anterior puede parecer posterior.
+    """
+    conn.execute(
+        """UPDATE flights
+              SET first_seen_utc = (
+                  SELECT f2.first_seen_utc
+                    FROM flights f2
+                   WHERE f2.fa_flight_id IN (?, ?)
+                     AND f2.first_seen_utc IS NOT NULL
+                   ORDER BY datetime(f2.first_seen_utc) ASC
+                   LIMIT 1)
+            WHERE fa_flight_id = ?""",
+        (superviviente, perdedora, superviviente),
+    )
+
+
 def _canonical_flight_id(conn: sqlite3.Connection, fa_flight_id: str) -> str:
     """Resolve a previously reconciled provider alias without mutating callers."""
     try:
@@ -461,6 +502,9 @@ def reconcile_synthetic_flights(
             (real_id, syn_id),
         )
         conn.execute("DELETE FROM actuals WHERE fa_flight_id=?", (syn_id,))
+        # Antes del DELETE: despues la fila del placeholder ya no esta y con
+        # ella se va el unico registro de cuando supimos del vuelo.
+        _preservar_primer_avistaje(conn, real_id, syn_id)
         conn.execute("DELETE FROM flights WHERE fa_flight_id=?", (syn_id,))
         reconciled += 1
 
@@ -695,6 +739,7 @@ def reconcile_fr24_flight_aliases(
                 (alias_id, canonical_id, alias["scheduled_out_utc"], _now_iso()),
             )
             conn.execute("DELETE FROM actuals WHERE fa_flight_id=?", (alias_id,))
+            _preservar_primer_avistaje(conn, canonical_id, alias_id)
             conn.execute("DELETE FROM flights WHERE fa_flight_id=?", (alias_id,))
             reconciled += 1
 
