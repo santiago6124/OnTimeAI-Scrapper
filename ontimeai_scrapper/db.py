@@ -454,10 +454,30 @@ def reconcile_synthetic_flights(
 
     # 1. Find (syn_id -> real_id) pairs sharing flight identity. Restrict to recent
     #    fl_date so the self-join stays cheap (placeholders are always near-future).
+    # El emparejamiento NO incluye `op_carrier`, a proposito.
+    #
+    # FR24 lista el mismo avion una vez bajo el codigo comercial y otra bajo el
+    # que lo opera, asi que `_synthetic_id` —que se arma con el carrier— genera
+    # dos placeholders para un solo vuelo:
+    #
+    #     SYN-AA4607-ATL-LGA-2026-09-27   American
+    #     SYN-YX4607-ATL-LGA-2026-09-27   Republic, que lo opera
+    #
+    # Y cuando el vuelo real aparecia bajo el operador, el placeholder con el
+    # codigo comercial no emparejaba y sobrevivia hasta que el TTL lo purgaba.
+    # Medido el 27/09 sobre la ventana de 20 h: seis vuelos duplicados asi, uno
+    # de ellos (AM979 -> MTY) con el id real ya presente y el placeholder al
+    # lado sin colapsar.
+    #
+    # Numero de vuelo + origen + destino + fecha ya identifican el servicio: que
+    # dos aerolineas distintas usen el mismo numero en la misma ruta el mismo
+    # dia no pasa. Igual se exige que los horarios no difieran mas de una hora,
+    # como red de seguridad, tolerando que alguno no lo tenga cargado.
     pairs = conn.execute(
         """
         WITH ident AS (
             SELECT fa_flight_id, op_carrier, flight_number, origin, dest, fl_date,
+                   scheduled_out_utc,
                    (fa_flight_id LIKE 'SYN-%') AS is_syn
             FROM flights
             WHERE op_carrier IS NOT NULL AND flight_number IS NOT NULL
@@ -467,9 +487,12 @@ def reconcile_synthetic_flights(
         SELECT s.fa_flight_id AS syn_id, r.fa_flight_id AS real_id
         FROM ident s
         JOIN ident r
-          ON  s.op_carrier = r.op_carrier AND s.flight_number = r.flight_number
+          ON  s.flight_number = r.flight_number
           AND s.origin = r.origin AND s.dest = r.dest AND s.fl_date = r.fl_date
         WHERE s.is_syn = 1 AND r.is_syn = 0
+          AND (s.scheduled_out_utc IS NULL OR r.scheduled_out_utc IS NULL
+               OR ABS(julianday(s.scheduled_out_utc)
+                      - julianday(r.scheduled_out_utc)) * 1440 <= 60)
         """
     ).fetchall()
 
