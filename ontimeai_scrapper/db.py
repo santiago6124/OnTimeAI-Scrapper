@@ -76,6 +76,40 @@ CREATE TABLE IF NOT EXISTS actuals (
 """
 
 HARVESTER_SCHEMA = """
+-- Cuando la aerolinea movio su hora estimada de salida, y a que valor.
+--
+-- `flights.estimated_out_utc` guarda el estado ACTUAL: cada ciclo lo
+-- sobreescribe y se pierde cuando cambio. Sin esa serie no se puede responder
+-- la pregunta central de la tesis —cuantos minutos antes avisa el modelo que
+-- la aerolinea— porque no hay con que comparar: no se sabe cuando el carrier
+-- reconocio la demora. Ver Frontend #5.
+--
+-- Solo se escribe cuando el valor CAMBIA, no en cada ciclo. Medido sobre 5
+-- dias: de 1.450 salidas de ATL, 1.199 llegan con hora estimada y 564 (39%)
+-- la tienen distinta de la programada, asi que son del orden de cien filas
+-- por dia, no de las ~11.600 que saldrian de registrar cada ciclo.
+--
+-- Empieza a acumular desde que esto se despliega; no es reconstruible hacia
+-- atras, y por eso conviene que corra cuanto antes.
+--
+-- Sin clave primaria propia, a proposito. Con `(fa_flight_id,
+-- observed_at_utc)` dos escrituras del mismo vuelo dentro del mismo segundo
+-- colisionan y el `INSERT OR IGNORE` descarta una revision genuina sin que
+-- nadie lo note. Los ciclos estan a 30 minutos, pero un vuelo puede venir dos
+-- veces en el mismo tick desde capas distintas del harvester. Con el rowid
+-- implicito no hay nada que colisionar: toda revision queda.
+--
+-- Tampoco va la clave sobre `(fa_flight_id, estimated_out_utc)`, que seria
+-- deduplicar por valor: perderia el caso en que la aerolinea vuelve a una hora
+-- que ya habia publicado, que es un cambio real y cuenta.
+CREATE TABLE IF NOT EXISTS flight_estimate_log (
+    fa_flight_id      TEXT NOT NULL,
+    observed_at_utc   TEXT NOT NULL,
+    estimated_out_utc TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_estimate_log_vuelo
+    ON flight_estimate_log (fa_flight_id, observed_at_utc);
+
 CREATE TABLE IF NOT EXISTS tail_lineage_cache (
     tail TEXT PRIMARY KEY,
     hydrated_until TEXT NOT NULL,
@@ -371,9 +405,43 @@ def upsert_flights(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> 
             "first_seen": now,
             "last_updated": now,
         }
+        # Antes de sobreescribir: si la aerolinea movio su estimacion, anotarlo.
+        # Va ANTES del upsert porque despues ya no se puede saber cual era el
+        # valor anterior.
+        _registrar_revision_de_horario(conn, canonical_id, params["estimated_out_utc"], now)
         conn.execute(sql, params)
         count += 1
     return count
+
+
+def _registrar_revision_de_horario(
+    conn: sqlite3.Connection,
+    fa_flight_id: str,
+    estimada: str | None,
+    ahora: str,
+) -> bool:
+    """Anota en `flight_estimate_log` que la aerolinea movio su hora estimada.
+
+    Devuelve True si anoto algo. No anota cuando el valor no cambio, que es el
+    caso de la enorme mayoria de los ciclos.
+
+    La primera vez que un vuelo trae hora estimada tambien se anota: es la
+    linea base contra la que se miden las revisiones siguientes.
+    """
+    if not estimada:
+        return False
+    fila = conn.execute(
+        "SELECT estimated_out_utc FROM flights WHERE fa_flight_id = ?",
+        (fa_flight_id,),
+    ).fetchone()
+    if fila is not None and fila[0] == estimada:
+        return False
+    conn.execute(
+        """INSERT INTO flight_estimate_log
+           (fa_flight_id, observed_at_utc, estimated_out_utc) VALUES (?, ?, ?)""",
+        (fa_flight_id, ahora, estimada),
+    )
+    return True
 
 
 def upsert_actuals(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]]) -> int:
