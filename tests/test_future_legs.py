@@ -410,3 +410,61 @@ class TestPurgaPorTtlNoDejaHuerfanos:
 
         assert db.reconcile_synthetic_flights(conn, ttl_hours=3)["purged"] == 1
         assert db.reconcile_synthetic_flights(conn, ttl_hours=3)["purged"] == 0
+
+
+class TestHorizonteDePiernasFuturas:
+    """El horizonte decide cuánto del itinerario se conserva, y estaba tirando
+    casi todo.
+
+    El chain-walk pide `flight/list.json` por matrícula y FR24 devuelve el
+    itinerario COMPLETO en la misma respuesta. Medido el 19/10 sobre cuatro
+    matrículas de ATL: entre 12 y 18 piernas futuras, la más lejana a 50-72
+    horas. Con el horizonte en 6 se conservaban 1 o 2, o sea el 6-14%.
+
+    Subirlo no cuesta ninguna llamada extra. Lo que limitaba la cobertura de
+    rotaciones era esto y no el presupuesto de hidratación: el reparto de la
+    cola en producción muestra que las clases críticas suman ~27 y entran
+    completas en los 30 que hay.
+    """
+
+    @staticmethod
+    def _pierna(horas_adelante: float, origen="ATL", dest="MIA"):
+        sale = datetime.now(timezone.utc) + timedelta(hours=horas_adelante)
+        return {"origin": origen, "dest": dest, "cancelled": 0,
+                "scheduled_out_utc": sale.isoformat()}
+
+    def test_el_default_conserva_mas_de_seis_horas(self) -> None:
+        """Si alguien lo vuelve a 6, este test avisa y dice por qué no."""
+        from ontimeai_scrapper import config
+
+        assert config.FUTURE_LEG_HORIZON_HOURS >= 24, (
+            "con 6 horas se conservaba el 6-14% del itinerario que FR24 ya "
+            "devuelve en la misma llamada")
+
+    def test_conserva_una_pierna_del_dia_siguiente(self) -> None:
+        ahora = datetime.now(timezone.utc)
+        assert _is_future_atl_leg(self._pierna(20), horizon_hours=24, now=ahora)
+
+    def test_con_el_horizonte_viejo_esa_pierna_se_tiraba(self) -> None:
+        """Deja escrito el comportamiento que se cambió: la misma pierna que
+        hoy se conserva, con 6 horas se descartaba."""
+        ahora = datetime.now(timezone.utc)
+        assert not _is_future_atl_leg(self._pierna(20), horizon_hours=6, now=ahora)
+
+    def test_sigue_descartando_lo_que_queda_fuera_del_horizonte(self) -> None:
+        ahora = datetime.now(timezone.utc)
+        assert not _is_future_atl_leg(self._pierna(30), horizon_hours=24, now=ahora)
+
+    def test_sigue_descartando_las_piernas_que_no_tocan_ATL(self) -> None:
+        """El filtro por ATL es lo que acota el crecimiento de la base al subir
+        el horizonte: de un itinerario de 18 piernas sólo entran las que pasan
+        por el anchor."""
+        ahora = datetime.now(timezone.utc)
+        assert not _is_future_atl_leg(
+            self._pierna(10, origen="JFK", dest="LAX"), horizon_hours=24, now=ahora)
+        assert _is_future_atl_leg(
+            self._pierna(10, origen="JFK", dest="ATL"), horizon_hours=24, now=ahora)
+
+    def test_sigue_descartando_las_pasadas(self) -> None:
+        ahora = datetime.now(timezone.utc)
+        assert not _is_future_atl_leg(self._pierna(-2), horizon_hours=24, now=ahora)
