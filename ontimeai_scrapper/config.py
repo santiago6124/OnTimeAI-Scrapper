@@ -43,7 +43,35 @@ HORARIO_PAGINAS: int = int(os.getenv("HORARIO_PAGINAS", "2"))
 HORARIO_HORAS: tuple[float, ...] = tuple(
     float(x) for x in os.getenv("HORARIO_HORAS", "2,4,6,8,10,12").split(",") if x.strip()
 )
-FUTURE_LEG_HORIZON_HOURS: int = int(os.getenv("FUTURE_LEG_HORIZON_HOURS", "12"))
+# Horas hacia adelante que se conservan del itinerario de un avion.
+#
+# El chain-walk pide `flight/list.json` por matricula y FR24 devuelve el
+# itinerario COMPLETO en la misma respuesta: medido el 19/10 sobre cuatro
+# matriculas de ATL, entre 12 y 18 piernas futuras que llegan a 50-72 horas.
+#
+# Con el horizonte en 6 se conservaban 1 o 2 de esas 12-18, o sea el 6-14%:
+#
+#     N960AT   12 piernas futuras, la mas lejana a 50,7h  ->  1  ( 8%)
+#     N135EV   16 piernas,                     a 72,2h   ->  1  ( 6%)
+#     N893AT   14 piernas,                     a 50,4h   ->  2  (14%)
+#     N915AT   18 piernas,                     a 51,6h   ->  2  (11%)
+#
+# Subirlo no cuesta ninguna llamada extra: el dato ya viene. Se tiraba.
+#
+# Esto es lo que limitaba la cobertura de rotaciones, no el presupuesto de
+# hidratacion. El reparto de la cola, medido en produccion el 19/10, muestra
+# que las clases criticas suman ~27 y entran completas en los 30 que hay:
+#
+#     bootstrap 0, pendiente_resultado 18, sin_predecir 1, predicho_hoy 8,
+#     vencido 3759, necesitan 3786, presupuesto 30, alcanzados 30
+#
+# Con 3.786 vencidos y 30 por ciclo cada 15 minutos, un avion se rehidrata
+# cada ~31 horas. Con horizonte de 6 h la chance de pegarle a la ventana justa
+# era ~19%, del mismo orden que el 33% de rotaciones conocidas a tiempo.
+#
+# Va en 24 y no en 72 para acotar el crecimiento de la base, que fue el costo
+# que hundio el intento de subir el presupuesto a 70 (de 14 a 30 MB/dia).
+FUTURE_LEG_HORIZON_HOURS: int = int(os.getenv("FUTURE_LEG_HORIZON_HOURS", "24"))
 
 LINEAGE_FRESHNESS_HOURS: int = int(os.getenv("LINEAGE_FRESHNESS_HOURS", "6"))
 LINEAGE_MAX_CONSECUTIVE_FAILURES: int = int(os.getenv("LINEAGE_MAX_CONSECUTIVE_FAILURES", "5"))
