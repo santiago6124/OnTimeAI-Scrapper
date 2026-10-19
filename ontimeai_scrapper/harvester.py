@@ -31,6 +31,10 @@ from .fr24_client import (
     normalize_actual,
     normalize_flight,
 )
+# El modulo entero y no solo los nombres: `ULTIMO_REPARTO` se
+# REASIGNA en cada llamada, asi que un from-import se quedaria con el
+# diccionario vacio del arranque.
+from . import lineage_cache
 from .lineage_cache import (
     HydrationStatus,
     maybe_hydrate_tail,
@@ -203,8 +207,10 @@ def harvest_chain_walk(
     stats.cache_hits = len(candidate_tails) - len(to_hydrate)
 
     log.info(
-        "chain_walk: candidates=%d to_hydrate=%d (cache_hits=%d, budget=%d, freshness_h=%d)",
-        len(candidate_tails), len(to_hydrate), stats.cache_hits, budget, freshness_hours,
+        "chain_walk: candidates=%d to_hydrate=%d (cache_hits=%d, budget=%d, "
+        "freshness_h=%d) reparto=%s",
+        len(candidate_tails), len(to_hydrate), stats.cache_hits, budget,
+        freshness_hours, lineage_cache.ULTIMO_REPARTO,
     )
 
     if dry_run:

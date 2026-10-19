@@ -26,6 +26,9 @@ from ontimeai_scrapper.lineage_cache import (
 )
 
 
+from ontimeai_scrapper import lineage_cache  # noqa: E402
+
+
 @pytest.fixture
 def conn() -> sqlite3.Connection:
     c = sqlite3.connect(":memory:")
@@ -120,3 +123,58 @@ class TestElPresupuestoVaAlHueco:
         _salida(conn, fid="F2", tail="N111AA", en_horas=5, con_prediccion=False)
         assert salidas_sin_predecir_tail_order(conn) == ["N111AA"]
         assert select_tails_to_hydrate(conn, {"N111AA"}, budget=10) == ["N111AA"]
+
+
+class TestRepartoDeLaCola:
+    """El reparto por clase de prioridad, que es lo que permite decidir el
+    presupuesto con evidencia.
+
+    Hace falta porque el log no permitía distinguir "el presupuesto alcanza" de
+    "las clases críticas se quedan sin lugar": `cache_hits` se calcula como
+    `candidatos - a_hidratar`, así que con presupuesto 30 dice siempre
+    "candidatos menos 30" sin importar cuántos necesitaban refresco.
+
+    Con ese número ya se decidió mal una vez. Se subió el presupuesto de 30 a
+    70 (#8), no movió la cobertura y se revirtió (#9) con la hipótesis de que
+    el cuello de botella era la lista de candidatos y no el presupuesto. Esa
+    hipótesis es falsa —medido el 19/10, el tablero futuro de FR24 trae la
+    matrícula en el 92-100% de las filas hasta 12 h antes— y además ese
+    experimento corrió ANTES del arreglo de priorización (#10), así que su
+    conclusión no aplica al código actual.
+    """
+
+    def test_el_reparto_se_publica(self, conn) -> None:
+        _salida(conn, fid="F1", tail="N111AA", en_horas=1, con_prediccion=False)
+        select_tails_to_hydrate(conn, {"N111AA"}, budget=10)
+        assert lineage_cache.ULTIMO_REPARTO["sin_predecir"] == 1
+        assert lineage_cache.ULTIMO_REPARTO["presupuesto"] == 10
+
+    def test_distingue_los_que_necesitan_de_los_que_entran(self, conn) -> None:
+        """Es la distinción que `cache_hits` no permitía hacer: con tres que
+        necesitan y presupuesto de uno, `necesitan` tiene que decir tres."""
+        for i in range(3):
+            _salida(conn, fid=f"F{i}", tail=f"N{i}11AA", en_horas=1 + i,
+                    con_prediccion=False)
+        tails = {f"N{i}11AA" for i in range(3)}
+        elegidos = select_tails_to_hydrate(conn, tails, budget=1)
+        r = lineage_cache.ULTIMO_REPARTO
+        assert len(elegidos) == 1
+        assert r["necesitan"] == 3, "tiene que contar los tres, no sólo el que entró"
+        assert r["alcanzados"] == 1
+
+    def test_con_presupuesto_de_sobra_alcanzados_iguala_a_necesitan(self, conn) -> None:
+        _salida(conn, fid="F1", tail="N111AA", en_horas=1, con_prediccion=False)
+        select_tails_to_hydrate(conn, {"N111AA"}, budget=50)
+        r = lineage_cache.ULTIMO_REPARTO
+        assert r["alcanzados"] == r["necesitan"]
+
+    def test_un_avion_que_no_necesita_refresco_no_entra_en_ninguna_clase(self, conn) -> None:
+        """Si contara en alguna clase, el reparto diría que falta presupuesto
+        donde no falta, que es el error que se quiere evitar."""
+        _salida(conn, fid="F1", tail="N111AA", en_horas=1, con_prediccion=False)
+        select_tails_to_hydrate(conn, {"N111AA"}, budget=10)
+        assert lineage_cache.ULTIMO_REPARTO["necesitan"] == 1
+        # Sin candidatos el reparto tiene que reflejar ESTE ciclo, no el
+        # anterior: la funcion retorna temprano y dejaba el valor viejo.
+        select_tails_to_hydrate(conn, set(), budget=10)
+        assert lineage_cache.ULTIMO_REPARTO["necesitan"] == 0
