@@ -21,6 +21,8 @@ from . import config, db
 from .fr24_client import FR24Client, FR24EmptyResponseError, FR24Error, FR24RateLimitedError
 from .fr24_http import fetch_aircraft_history
 
+ULTIMO_REPARTO: dict[str, int] = {}
+
 log = logging.getLogger(__name__)
 
 
@@ -360,7 +362,15 @@ def select_tails_to_hydrate(
     Subir el presupuesto de 30 a 70 no movio la cobertura por esto: los 40
     lugares nuevos fueron a mas de lo mismo.
     """
+    # Una sola declaracion y antes de cualquier asignacion: Python no acepta
+    # `global` repetido ni despues de asignar.
+    global ULTIMO_REPARTO
+
     if not candidate_tails:
+        # El reparto se publica tambien en el camino vacio. Si no, queda el del
+        # ciclo anterior y el log lo muestra como si fuera de este: lo encontro
+        # un test.
+        ULTIMO_REPARTO = {"necesitan": 0, "presupuesto": budget, "alcanzados": 0}
         return []
 
     placeholders = ",".join("?" * len(candidate_tails))
@@ -502,6 +512,29 @@ def select_tails_to_hydrate(
         bootstrap_pending + pending_outcome_list + sin_predecir_list
         + predicted_today_list + high_freq + never + expired
     )
+    # El reparto por clase, para saber si el presupuesto alcanza o si las
+    # clases criticas se quedan sin lugar.
+    #
+    # Hace falta porque el log no permitia distinguir las dos cosas:
+    # `cache_hits` se calcula como `candidatos - a_hidratar`, asi que con
+    # presupuesto 30 dice siempre "candidatos menos 30" sin importar cuantos
+    # necesitaban refresco de verdad. Con ese numero no se puede decidir el
+    # presupuesto, y de hecho ya se eligio mal una vez: se subio a 70 (#8), no
+    # movio la cobertura y se revirtio (#9). Ese experimento corrio ANTES del
+    # arreglo de priorizacion (#10), asi que su conclusion no aplica al codigo
+    # actual.
+    ULTIMO_REPARTO = {
+        "bootstrap": len(bootstrap_pending),
+        "pendiente_resultado": len(pending_outcome_list),
+        "sin_predecir": len(sin_predecir_list),
+        "predicho_hoy": len(predicted_today_list),
+        "alta_frecuencia": len(high_freq),
+        "nunca": len(never),
+        "vencido": len(expired),
+        "necesitan": len(ordered),
+        "presupuesto": budget,
+        "alcanzados": min(len(ordered), budget),
+    }
     return ordered[:budget]
 
 
