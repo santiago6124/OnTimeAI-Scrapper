@@ -1,0 +1,8 @@
+# Herramientas de desarrollo y CI. No viajan en la imagen: Dockerfile.harvester
+# instala sólo requirements.txt.
+pytest
+pytest-cov
+# Gate y reporte de complejidad ciclomática (scripts/complejidad.py). Fijadas:
+# una versión nueva de ruff puede contar distinto y mover la baseline sola.
+ruff==0.17.2
+radon==6.0.1

@@ -1,0 +1,20 @@
+# Sólo configuración de ruff. La de pytest sigue en pytest.ini, que tiene
+# precedencia sobre este archivo y no hace falta moverla.
+
+[tool.ruff]
+# Mismo alcance que scripts/complejidad.py: lo que despliega Dockerfile.harvester,
+# que copia a la imagen únicamente el paquete `ontimeai_scrapper`. Los tests y
+# los scripts de `scripts/` (validate_sources.py, analyze_future_legs.py) son
+# herramientas de desarrollo: no viajan en la imagen y quedan fuera.
+extend-exclude = [
+    "tests",
+    "scripts",
+]
+
+[tool.ruff.lint]
+# Por ahora ruff sólo vigila complejidad (ver docs/COMPLEJIDAD.md). Sumar
+# reglas de estilo es otra decisión, con su propia baseline.
+select = ["C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
