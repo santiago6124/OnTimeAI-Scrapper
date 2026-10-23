@@ -24,15 +24,18 @@ max-complexity = 10
 
 [tool.coverage.run]
 branch = true
-# `source` fija el alcance en el repo: así `pytest --cov` cuenta también los
-# módulos que ningún test importa (hoy backfill_outcomes.py, al 0 %) en vez de
-# medir sólo lo que se ejecutó, y el número es el mismo en CI y en local.
-source = ["."]
+# Qué se mide: exactamente lo que despliega Dockerfile.harvester, el paquete
+# `ontimeai_scrapper`; es el mismo alcance que el gate de complejidad y que la
+# medición del hub OnTimeAI-Calidad. Los scripts de `scripts/` son
+# herramientas de desarrollo con tests propios, pero no corren en producción
+# y no entran en el número.
+source = ["ontimeai_scrapper"]
 omit = ["tests/*"]
 
 [tool.coverage.report]
 # Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
 # acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
-# del 2026-10-23: 52,9 % combinado (56,2 % de líneas, 41,9 % de ramas).
-fail_under = 52
+# del 2026-10-22 sobre el paquete desplegado (commit 2697284): 50,7 % de
+# líneas, 33,7 % de ramas, 46,7 % combinado.
+fail_under = 46
 precision = 1
