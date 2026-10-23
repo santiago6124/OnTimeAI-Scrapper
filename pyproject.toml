@@ -1,5 +1,5 @@
-# Sólo configuración de ruff. La de pytest sigue en pytest.ini, que tiene
-# precedencia sobre este archivo y no hace falta moverla.
+# Configuración de ruff y de coverage. La de pytest sigue en pytest.ini, que
+# tiene precedencia sobre este archivo y no hace falta moverla.
 
 [tool.ruff]
 # Mismo alcance que scripts/complejidad.py: lo que despliega Dockerfile.harvester,
@@ -12,9 +12,30 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# Por ahora ruff sólo vigila complejidad (ver docs/COMPLEJIDAD.md). Sumar
-# reglas de estilo es otra decisión, con su propia baseline.
-select = ["C901"]
+# Complejidad (ver docs/COMPLEJIDAD.md) más los "bugs críticos": errores de
+# sintaxis, nombres indefinidos, redefiniciones y comparaciones inválidas, lo
+# que revienta en tiempo de ejecución. Es la misma selección que usa el
+# template de Python de GitHub Actions (E9, F63, F7, F82). Las reglas de
+# estilo son otra decisión, con su propia baseline.
+select = ["C901", "E9", "F63", "F7", "F82"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.coverage.run]
+branch = true
+# Qué se mide: exactamente lo que despliega Dockerfile.harvester, el paquete
+# `ontimeai_scrapper`; es el mismo alcance que el gate de complejidad y que la
+# medición del hub OnTimeAI-Calidad. Los scripts de `scripts/` son
+# herramientas de desarrollo con tests propios, pero no corren en producción
+# y no entran en el número.
+source = ["ontimeai_scrapper"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
+# acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
+# del 2026-10-22 sobre el paquete desplegado (commit 2697284): 50,7 % de
+# líneas, 33,7 % de ramas, 46,7 % combinado.
+fail_under = 46
+precision = 1

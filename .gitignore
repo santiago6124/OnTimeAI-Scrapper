@@ -46,3 +46,11 @@ desktop.ini
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Salidas de los gates de calidad del CI cuando se corren en local
+.coverage
+coverage.xml
+junit.xml
+jscpd/
+diff-cover.md
+complejidad.json
