@@ -1,5 +1,5 @@
-# Sólo configuración de ruff. La de pytest sigue en pytest.ini, que tiene
-# precedencia sobre este archivo y no hace falta moverla.
+# Configuración de ruff y de coverage. La de pytest sigue en pytest.ini, que
+# tiene precedencia sobre este archivo y no hace falta moverla.
 
 [tool.ruff]
 # Mismo alcance que scripts/complejidad.py: lo que despliega Dockerfile.harvester,
@@ -12,9 +12,29 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# Por ahora ruff sólo vigila complejidad (ver docs/COMPLEJIDAD.md). Sumar
-# reglas de estilo es otra decisión, con su propia baseline.
-select = ["C901"]
+# Complejidad (ver docs/COMPLEJIDAD.md) más los "bugs críticos": errores de
+# sintaxis, nombres indefinidos, redefiniciones y comparaciones inválidas, lo
+# que revienta en tiempo de ejecución. Es la misma selección que usa el
+# template de Python de GitHub Actions (E9, F63, F7, F82). Las reglas de
+# estilo son otra decisión, con su propia baseline.
+select = ["C901", "E9", "F63", "F7", "F82"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.coverage.run]
+branch = true
+# `source` fija el alcance en el repo: así `pytest --cov` cuenta también los
+# módulos que ningún test importa (hoy backfill_outcomes.py, al 0 %) en vez de
+# medir sólo lo que se ejecutó, y el número es el mismo en CI y en local.
+source = ["."]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
+# acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
+# del 2026-10-23: 52,9 % combinado (56,2 % de líneas, 41,9 % de ramas). Está
+# fijado un punto por encima a propósito, para que el primer run del PR
+# demuestre que el gate corta; el commit siguiente lo baja a 52.
+fail_under = 54
+precision = 1
