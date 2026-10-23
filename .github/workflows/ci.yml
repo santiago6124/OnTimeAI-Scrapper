@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # diff-cover compara contra la rama base: necesita el historial.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -28,11 +31,12 @@ jobs:
       - name: Instalar dependencias
         # Dos archivos, no intercambiables:
         #   requirements.txt      → runtime del harvester (Dockerfile.harvester).
-        #   requirements-dev.txt  → pytest y las herramientas del gate de
-        #                           complejidad (ruff, radon), que no viajan en
-        #                           la imagen. Se instalan en un solo comando
-        #                           para que pip resuelva las restricciones de
-        #                           las dos listas a la vez.
+        #   requirements-dev.txt  → pytest, cobertura (pytest-cov, diff-cover) y
+        #                           las herramientas del gate de complejidad
+        #                           (ruff, radon), que no viajan en la imagen.
+        #                           Se instalan en un solo comando para que pip
+        #                           resuelva las restricciones de las dos listas
+        #                           a la vez.
         run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Complejidad ciclomática
@@ -52,5 +56,50 @@ jobs:
           name: complejidad
           path: complejidad.json
 
-      - name: Tests
-        run: pytest
+      - name: Bugs críticos (análisis estático)
+        # Errores de sintaxis, nombres indefinidos, redefiniciones y
+        # comparaciones inválidas: lo que revienta en tiempo de ejecución, no
+        # estilo. Selección E9, F63, F7, F82 (la del template de Python de
+        # GitHub Actions) sobre el alcance de pyproject.toml.
+        run: ruff check --output-format github .
+
+      - name: Duplicación
+        # Quality gate: más de 5 % de líneas duplicadas en el código productivo
+        # corta el pipeline. jscpd corre con npx porque no hay un equivalente
+        # en Python que dé el porcentaje; el runner ya trae Node.
+        run: |
+          npx --yes jscpd@4 --min-tokens 50 --min-lines 5 --threshold 5 \
+            --format python --reporters console,json --output jscpd \
+            ontimeai_scrapper
+
+      - name: Tests con cobertura
+        # Corren todos. La cobertura mide líneas y ramas (cobertura de
+        # decisión) sobre el alcance de pyproject.toml y falla por debajo del
+        # trinquete de `fail_under`.
+        run: pytest --cov --cov-report=xml --cov-report=term-missing:skip-covered --junitxml=junit.xml
+
+      - name: Cobertura sobre el código nuevo
+        # Quality gate: las líneas que cambia el PR tienen que estar cubiertas
+        # al 80 %. Sólo en PR, porque en main no hay contra qué comparar.
+        if: github.event_name == 'pull_request'
+        run: |
+          diff-cover coverage.xml --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=80 --markdown-report diff-cover.md
+
+      - name: Resumen de calidad
+        if: always()
+        run: |
+          python scripts/calidad_resumen.py --cobertura coverage.xml \
+            --jscpd jscpd/jscpd-report.json --diff-cover diff-cover.md \
+            --salida "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: calidad
+          path: |
+            coverage.xml
+            junit.xml
+            jscpd/
+            diff-cover.md
+          if-no-files-found: ignore
