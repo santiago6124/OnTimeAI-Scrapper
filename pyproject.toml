@@ -33,8 +33,6 @@ omit = ["tests/*"]
 [tool.coverage.report]
 # Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
 # acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
-# del 2026-10-23: 52,9 % combinado (56,2 % de líneas, 41,9 % de ramas). Está
-# fijado un punto por encima a propósito, para que el primer run del PR
-# demuestre que el gate corta; el commit siguiente lo baja a 52.
-fail_under = 54
+# del 2026-10-23: 52,9 % combinado (56,2 % de líneas, 41,9 % de ramas).
+fail_under = 52
 precision = 1
