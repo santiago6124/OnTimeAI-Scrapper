@@ -1,0 +1,10 @@
+{
+  "_": "Funciones productivas por encima del umbral cuando se instaló el gate. Sólo puede achicarse: ver docs/COMPLEJIDAD.md.",
+  "umbral": 10,
+  "exentas": {
+    "ontimeai_scrapper/harvester.py::_run_once": 24,
+    "ontimeai_scrapper/lineage_cache.py::select_tails_to_hydrate": 24,
+    "ontimeai_scrapper/db.py::reconcile_fr24_flight_aliases": 16,
+    "ontimeai_scrapper/fr24_http.py::fetch_aircraft_history": 12
+  }
+}

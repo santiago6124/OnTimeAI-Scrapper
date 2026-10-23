@@ -21,15 +21,36 @@ jobs:
           # Misma versión que el harvester en producción (Dockerfile.harvester).
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Instalar dependencias
-        # pytest no está declarado en requirements.txt, que sólo lista lo que
-        # necesita el harvester en runtime. Se instala aparte para no sumarle
-        # una dependencia de desarrollo a la imagen.
+        # Dos archivos, no intercambiables:
+        #   requirements.txt      → runtime del harvester (Dockerfile.harvester).
+        #   requirements-dev.txt  → pytest y las herramientas del gate de
+        #                           complejidad (ruff, radon), que no viajan en
+        #                           la imagen. Se instalan en un solo comando
+        #                           para que pip resuelva las restricciones de
+        #                           las dos listas a la vez.
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Complejidad ciclomática
+        # Gate: ninguna función del paquete `ontimeai_scrapper` por encima de 10
+        # (McCabe, ruff C901) fuera de las exentas en .complejidad-baseline.json,
+        # y esa lista sólo puede achicarse. Corre antes que los tests porque
+        # tarda segundos y un fallo acá no necesita la suite entera. El reporte
+        # de radon va al resumen del job y como artifact. Ver docs/COMPLEJIDAD.md.
         run: |
-          pip install -r requirements.txt
-          pip install pytest
+          python scripts/complejidad.py --check \
+            --reporte complejidad.json \
+            --resumen "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: complejidad
+          path: complejidad.json
 
       - name: Tests
         run: pytest
