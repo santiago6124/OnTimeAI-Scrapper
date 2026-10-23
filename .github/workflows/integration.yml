@@ -1,0 +1,69 @@
+name: Integración
+
+# Prueba de integración contra el GCS real: el contrato de compare-and-swap
+# por generación que protege live_data.db de escrituras concurrentes. Corre en
+# el bucket de QA `ontimeai-prod-qa` (objetos con nombre único, borrados al
+# día), nunca contra el bucket productivo.
+#
+# Se dispara en cada push a main que toque el cliente de GCS o este test, en
+# los PR que los cambien (autoprueba), a mano, y una vez por día para detectar
+# cambios del lado del servicio.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ontimeai_scrapper/db.py
+      - tests/test_integracion_gcs.py
+      - .github/workflows/integration.yml
+  pull_request:
+    paths:
+      - ontimeai_scrapper/db.py
+      - tests/test_integracion_gcs.py
+      - .github/workflows/integration.yml
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  gcs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ontimeai-prod
+          workload_identity_provider: projects/871707213932/locations/global/workloadIdentityPools/github/providers/github
+          service_account: github-deployer@ontimeai-prod.iam.gserviceaccount.com
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Compare-and-swap contra GCS real
+        env:
+          ONTIMEAI_QA_BUCKET: ontimeai-prod-qa
+          GCP_PROJECT: ontimeai-prod
+        run: pytest tests/test_integracion_gcs.py -v -p no:cacheprovider 2>&1 | tee integracion.log
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Integración GCS (compare-and-swap) contra \`ontimeai-prod-qa\`"
+            echo ""
+            echo '```'
+            grep -E "PASSED|FAILED|SKIPPED|passed|failed" integracion.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
