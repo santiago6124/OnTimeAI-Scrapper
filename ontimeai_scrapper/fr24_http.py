@@ -57,7 +57,7 @@ def _is_future_atl_leg(f: dict[str, Any] | None, *, horizon_hours: int, now: dat
     return now < dep <= now + timedelta(hours=horizon_hours)
 
 
-def fetch_aircraft_history(
+def fetch_aircraft_history(  # noqa: C901
     fr24_client: FR24Client,
     registration: str,
     *,

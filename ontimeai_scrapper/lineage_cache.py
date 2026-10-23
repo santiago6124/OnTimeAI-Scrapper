@@ -335,7 +335,7 @@ def salidas_sin_predecir_tail_order(
     return [r[0].strip().upper() for r in filas if r[0]]
 
 
-def select_tails_to_hydrate(
+def select_tails_to_hydrate(  # noqa: C901
     conn: sqlite3.Connection,
     candidate_tails: set[str],
     *,

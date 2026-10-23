@@ -656,7 +656,7 @@ def _actual_rows_conflict(left: sqlite3.Row | None, right: sqlite3.Row | None) -
     return abs(float(left_delay) - float(right_delay)) > 5.0
 
 
-def reconcile_fr24_flight_aliases(
+def reconcile_fr24_flight_aliases(  # noqa: C901
     conn: sqlite3.Connection, *, lookback_hours: int = 72
 ) -> dict[str, int]:
     """Collapse changed FR24 ids for the same physical flight.

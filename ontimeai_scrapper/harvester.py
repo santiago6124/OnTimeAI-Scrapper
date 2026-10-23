@@ -298,7 +298,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _run_once(args: argparse.Namespace) -> int:
+def _run_once(args: argparse.Namespace) -> int:  # noqa: C901
     _t_chain: float | None = None
     base_generation: int | None = None
     if args.local_db:
